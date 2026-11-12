@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date as dt_date, datetime
 from typing import Any, Literal, Optional
 from pydantic import BaseModel, field_validator
 
@@ -19,6 +19,23 @@ class SearchRequest(BaseModel):
     format: Optional[Literal["json", "text"]] = None
 
 
+class WebSearchRequest(BaseModel):
+    """Web search query request payload."""
+    query: str
+    limit: int = 5
+    """Response format: 'json' (default) or 'text' for RAG LLM context."""
+    format: Optional[Literal["json", "text"]] = None
+
+
+class WebSearchResultItem(BaseModel):
+    """Single web search result item from SearXNG."""
+    title: str
+    url: str
+    content: str
+    engine: Optional[str] = None
+    score: Optional[float] = None
+
+
 class SingleSearchResult(BaseModel):
     """Single search result item."""
     doc_id: int
@@ -26,7 +43,7 @@ class SingleSearchResult(BaseModel):
     content: str
     summary: str | None = None
     score: float
-    date: date
+    date: Optional[dt_date] = None
 
     @field_validator("content", mode="before")
     @classmethod

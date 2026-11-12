@@ -1,0 +1,15 @@
+use_default_settings: true
+
+server:
+  secret_key: "043a57e6515fef0938b3d63bdf3cb0bc27546a3b2bca60e4"
+  limiter: false
+  bind_address: "0.0.0.0"
+  port: 8080
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "vi"
+  formats:
+    - html
+    - json

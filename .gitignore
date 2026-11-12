@@ -13,6 +13,16 @@ stash.db
 # Secrets
 .env
 
+# Large archives & data transfers
+*.zst
+*.tar.gz
+*.zip
+
+# Benchmark data and result files
+bench/*.jsonl
+bench/*.json
+!bench/ftu500.json
+
 # SQLite database files
 *.sqlite
 *.sqlite3

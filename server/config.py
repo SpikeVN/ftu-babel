@@ -44,6 +44,9 @@ else:
 FTULABS_API_ENDPOINT = os.environ.get("FTULABS_API_ENDPOINT", "").rstrip("/")
 FTULABS_API_KEY = os.environ.get("FTULABS_API_KEY", "")
 
+# SearXNG Web Search
+SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8080").rstrip("/")
+
 
 def _join_endpoint(base: str, path: str) -> str:
     base = base.rstrip("/")

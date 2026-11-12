@@ -133,3 +133,25 @@ def format_documents_as_text(documents: Sequence[dict[str, Any]]) -> str:
 
     return "\n\n========================================\n\n".join(blocks)
 
+
+def format_web_search_results_as_text(results: Sequence[Any]) -> str:
+    """Format web search results into clean plain text for RAG LLM ingestion."""
+    if not results:
+        return "No web search results found."
+
+    blocks = []
+    for idx, r in enumerate(results, 1):
+        title = getattr(r, "title", None) or (r.get("title") if isinstance(r, dict) else "")
+        url = getattr(r, "url", None) or (r.get("url") if isinstance(r, dict) else "")
+        content = getattr(r, "content", None) or (r.get("content") or r.get("snippet") if isinstance(r, dict) else "")
+        lines = [
+            f"[{idx}] {title}",
+            f"URL: {url}",
+        ]
+        if content:
+            lines.append(f"Snippet: {content}")
+        blocks.append("\n".join(lines))
+
+    return "\n\n---\n\n".join(blocks)
+
+

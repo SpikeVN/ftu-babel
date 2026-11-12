@@ -10,6 +10,39 @@ def motd_root():
     return PlainTextResponse(random_motd())
 
 
+@router.get("/health")
+@router.get("/healthz")
+def health_endpoint():
+    """Health and diagnostics endpoint."""
+    from pathlib import Path
+    from server.config import DEFAULT_DB_PATH
+    db_path = Path(DEFAULT_DB_PATH)
+    db_exists = db_path.exists()
+    db_size = db_path.stat().st_size if db_exists else 0
+    error = None
+    count = 0
+    db_ok = False
+    try:
+        from server.services.stash import get_stash
+        stash = get_stash()
+        with stash.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT count(*) FROM storedcrawlresult")
+            count = cursor.fetchone()[0]
+            db_ok = True
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "db_path": str(db_path),
+        "db_exists": db_exists,
+        "db_size_bytes": db_size,
+        "row_count": count,
+        "error": error,
+    }
+
+
 def random_motd():
     return (
         random.choice(MESSAGES)

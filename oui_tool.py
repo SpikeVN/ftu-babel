@@ -110,7 +110,7 @@ class Tools:
             Citation-ready passages with doc_id, URL, publication date, summary, and clean text content.
         """
         base_url = self._base_url()
-        endpoint = f"{base_url}/search"
+        endpoint = f"{base_url}/query"
 
         # Map system prompt search modes to server hybrid_blend
         # hybrid_blend: 0.0 = pure vector (semantic), 1.0 = pure keyword (BM25), 0.5 = hybrid
@@ -132,11 +132,47 @@ class Tools:
 
         try:
             status_code, body = self._http_post(endpoint, payload, timeout=60.0)
+            if status_code == 404:
+                # Fallback to legacy /search endpoint if /query not yet available
+                status_code, body = self._http_post(f"{base_url}/search", payload, timeout=60.0)
             if status_code >= 400:
                 return f"Error {status_code} querying Babel knowledge base: {body}"
             return body
         except Exception as exc:
             return f"Error querying Babel knowledge base: {exc}"
+
+    def web_search(
+        self,
+        query: str,
+        limit: int = 5,
+        format: str = "text",
+    ) -> str:
+        """
+        Search the public web for real-time, external, or non-FTU information via SearXNG.
+        Use as a fallback when FTU knowledge base (babel_query) does not contain the answer.
+
+        Args:
+            query: The web search query string.
+            limit: Maximum number of search results to return (1-20, default 5).
+            format: Output format, either 'text' (default) or 'json'.
+
+        Returns:
+            Web search result snippets with titles and URLs.
+        """
+        base_url = self._base_url()
+        endpoint = f"{base_url}/web_search"
+        payload = {
+            "query": query,
+            "limit": max(1, min(int(limit), 20)),
+            "format": format if format in ("text", "json") else "text",
+        }
+        try:
+            status_code, body = self._http_post(endpoint, payload, timeout=30.0)
+            if status_code >= 400:
+                return f"Error {status_code} performing web search: {body}"
+            return body
+        except Exception as exc:
+            return f"Error performing web search: {exc}"
 
     def babel_fetch(
         self,
