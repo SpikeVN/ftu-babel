@@ -1,0 +1,33 @@
+services:
+  babel:
+    image: ghcr.io/spikevn/ftu-babel:latest
+    container_name: babel
+    restart: unless-stopped
+    # Optional local build configuration
+    build:
+      context: .
+      dockerfile: Containerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - STASH_DB_PATH=/app/data/stash.db
+      - FTULABS_API_ENDPOINT=${FTULABS_API_ENDPOINT:-}
+      - FTULABS_API_KEY=${FTULABS_API_KEY:-}
+      - ZEROENTROPY_API_KEY=${ZEROENTROPY_API_KEY:-}
+      - ZEROENTROPY_BASE_URL=${ZEROENTROPY_BASE_URL:-}
+    env_file:
+      - .env
+    volumes:
+      # Mount the database file into the writable /app/data directory.
+      # SQLite WAL sidecar files (stash.db-wal, stash.db-shm) will be written to /app/data.
+      - ./stash.db:/app/data/stash.db:rw
+      # If you already have existing wal/shm files in the project root, mount them as well:
+      - ./stash.db-wal:/app/data/stash.db-wal:rw
+      - ./stash.db-shm:/app/data/stash.db-shm:rw
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

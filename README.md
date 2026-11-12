@@ -96,19 +96,33 @@ python -m processing.embeddings --chunks
 
 ## Container Deployment
 
-Build and run using `podman` or `docker`:
+### Using Docker Compose / Podman Compose (Recommended)
+
+Start the entire stack with a single command:
 
 ```sh
-# Build the image
-podman build -t babel:latest .
+docker compose up -d
+# or with podman:
+podman compose up -d
+```
 
-# Run with a mounted volume for stash.db
-podman run -d \
+This reads `.env`, mounts `stash.db` into `/app/data/stash.db`, and exposes port `8000`.
+
+### Manual Container Run
+
+```sh
+# Pull the pre-built image
+docker pull ghcr.io/spikevn/ftu-babel:latest
+
+# Run with mounted database files
+docker run -d \
   --name babel \
   -p 8000:8000 \
-  -v ./stash.db:/app/stash.db:ro \
+  -v ./stash.db:/app/data/stash.db:rw \
+  -v ./stash.db-wal:/app/data/stash.db-wal:rw \
+  -v ./stash.db-shm:/app/data/stash.db-shm:rw \
   --env-file .env \
-  babel:latest
+  ghcr.io/spikevn/ftu-babel:latest
 ```
 
 ---

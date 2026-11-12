@@ -32,7 +32,13 @@ def load_env_file(path: Path | None = None) -> None:
 load_env_file()
 
 # Database settings
-DEFAULT_DB_PATH = os.environ.get("STASH_DB_PATH", str(PROJECT_ROOT / "stash.db"))
+_env_db_path = os.environ.get("STASH_DB_PATH")
+if _env_db_path:
+    DEFAULT_DB_PATH = _env_db_path
+elif Path("/app/data/stash.db").exists():
+    DEFAULT_DB_PATH = "/app/data/stash.db"
+else:
+    DEFAULT_DB_PATH = str(PROJECT_ROOT / "stash.db")
 
 # FTULabs Gateway / Upstream API
 FTULABS_API_ENDPOINT = os.environ.get("FTULABS_API_ENDPOINT", "").rstrip("/")
