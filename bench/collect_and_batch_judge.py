@@ -199,7 +199,7 @@ async def call_genie_with_babel(
     client: httpx.AsyncClient,
     messages: list[dict[str, Any]],
     tool_handler: BabelToolHandler,
-    max_tool_iterations: int = 3,
+    max_tool_iterations: int = 5,
     timeout: float = 60.0,
 ) -> dict[str, Any]:
     """Call Genie Alpha with active Babel tool execution loop."""

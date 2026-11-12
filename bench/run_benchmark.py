@@ -203,7 +203,7 @@ async def run_genie_agent_turn(
     model: str,
     user_messages: list[dict[str, Any]],
     tool_handler: BabelToolHandler,
-    max_tool_iterations: int = 3,
+    max_tool_iterations: int = 5,
     timeout: float = 60.0,
 ) -> dict[str, Any]:
     """
