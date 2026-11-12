@@ -1,0 +1,63 @@
+"""Babel server services package."""
+
+from server.services.embedding import (
+    EmbeddingClient,
+    get_shared_embed_client,
+    score_vector,
+    search_similar,
+)
+from server.services.rerank import (
+    get_shared_rerank_client,
+    rerank_hits,
+)
+from server.services.stash import (
+    Stash,
+    count,
+    exists,
+    get,
+    get_by_id,
+    get_by_url,
+    get_column,
+    get_columns,
+    get_default_stash,
+    get_document_detail,
+    get_documents,
+    get_documents_detail,
+    get_html,
+    get_markdown,
+    get_metadata,
+    get_stash,
+    iter_documents,
+    iter_records,
+    list_columns,
+    search_hybrid,
+)
+
+__all__ = [
+    "EmbeddingClient",
+    "get_shared_embed_client",
+    "score_vector",
+    "search_similar",
+    "get_shared_rerank_client",
+    "rerank_hits",
+    "Stash",
+    "get_stash",
+    "get_default_stash",
+    "get",
+    "get_by_id",
+    "get_by_url",
+    "get_column",
+    "get_columns",
+    "get_documents",
+    "iter_documents",
+    "iter_records",
+    "get_markdown",
+    "get_html",
+    "get_metadata",
+    "count",
+    "exists",
+    "list_columns",
+    "search_hybrid",
+    "get_document_detail",
+    "get_documents_detail",
+]
