@@ -3,10 +3,10 @@ services:
     image: ghcr.io/spikevn/ftu-babel:latest
     container_name: babel
     restart: unless-stopped
-    ports:
-      - "8386:8000"
+    network_mode: host
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8386"]
     environment:
-      - PORT=8000
+      - PORT=8386
       - STASH_DB_PATH=/app/data/stash.db
       - USEARCH_INDEX_PATH=/app/data/stash.usearch
       - MOSS_API_KEY=${MOSS_API_KEY:-}
@@ -16,7 +16,7 @@ services:
       - FTULABS_API_KEY=${FTULABS_API_KEY:-}
       - ZEROENTROPY_API_KEY=${ZEROENTROPY_API_KEY:-}
       - ZEROENTROPY_BASE_URL=${ZEROENTROPY_BASE_URL:-}
-      - SEARXNG_URL=http://searxng:8080
+      - SEARXNG_URL=http://localhost:8080
     env_file:
       - .env
     volumes:
@@ -24,7 +24,7 @@ services:
       - ./stash.db:/app/data/stash.db:rw
       - ./stash.usearch:/app/data/stash.usearch:rw
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8000/" ]
+      test: [ "CMD", "curl", "-f", "http://localhost:8386/" ]
       interval: 30s
       timeout: 5s
       retries: 3

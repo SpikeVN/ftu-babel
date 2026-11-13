@@ -39,7 +39,7 @@ def search_endpoint_get(
     request: Request,
     q: str = Query(..., description="Search query string"),
     limit: int = Query(10, ge=1, le=100, description="Maximum number of results to return"),
-    hybrid_blend: float = Query(0.5, ge=0.0, le=1.0, description="Keyword vs vector blend (0.0 = vector only, 1.0 = keyword only)"),
+    hybrid_blend: float = Query(0.5, ge=0.0, le=1.0, description="Vector vs keyword blend (0.0 = keyword only, 1.0 = vector only, 0.5 = hybrid)"),
     format: Optional[Literal["json", "text"]] = Query(None, description="Response format: 'json' (default) or 'text' for RAG LLM context"),
     stash_instance: Stash = Depends(get_stash),
 ):

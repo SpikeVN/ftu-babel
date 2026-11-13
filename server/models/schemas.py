@@ -13,7 +13,7 @@ class SearchRequest(BaseModel):
     """Search query request payload."""
     query: str
     limit: int = 10
-    """The percentage of blending keyword and vector search (0.0 = vector only, 1.0 = keyword only)."""
+    """Vector vs keyword blend (0.0 = keyword only, 1.0 = vector only, 0.5 = hybrid)."""
     hybrid_blend: float = 0.5
     """Response format: 'json' (default) or 'text' for RAG LLM context."""
     format: Optional[Literal["json", "text"]] = None
