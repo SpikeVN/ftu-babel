@@ -208,11 +208,28 @@ class Tools:
         except Exception as exc:
             return f"Error querying Babel knowledge base: {exc}"
 
-    def web_search(
+    @staticmethod
+    def _format_web_results_text(items: list[dict[str, Any]]) -> str:
+        """Format JSON web search results into numbered plain text."""
+        if not items:
+            return "No web search results found."
+        blocks: list[str] = []
+        for idx, item in enumerate(items, 1):
+            title = (item.get("title") or "").strip()
+            url = (item.get("url") or "").strip()
+            content = (item.get("content") or item.get("snippet") or "").strip()
+            lines = [f"[{idx}] {title}", f"URL: {url}"]
+            if content:
+                lines.append(f"Snippet: {content}")
+            blocks.append("\n".join(lines))
+        return "\n\n---\n\n".join(blocks)
+
+    async def web_search(
         self,
         query: str,
         limit: int = 5,
         format: Literal["text", "json"] = "text",
+        __event_emitter__: Optional[Callable[[dict[str, Any]], Any]] = None,
     ) -> str:
         """
         Search the public web for real-time, external, or non-FTU information via SearXNG.
@@ -228,15 +245,43 @@ class Tools:
         """
         base_url = self._base_url()
         endpoint = f"{base_url}/web_search"
+        out_format = format if format in ("text", "json") else "text"
+        req_format = "json" if __event_emitter__ is not None else out_format
         payload = {
             "query": query,
             "limit": max(1, min(int(limit), 20)),
-            "format": format if format in ("text", "json") else "text",
+            "format": req_format,
         }
         try:
-            status_code, body = self._http_post(endpoint, payload, timeout=30.0)
+            status_code, body = await asyncio.to_thread(self._http_post, endpoint, payload, 30.0)
             if status_code >= 400:
                 return f"Error {status_code} performing web search: {body}"
+
+            if __event_emitter__ is not None:
+                try:
+                    items = json.loads(body)
+                    if isinstance(items, list):
+                        for item in items:
+                            url = (item.get("url") or "").strip()
+                            title = (item.get("title") or url or "Web Result").strip()
+                            content = (item.get("content") or item.get("snippet") or "").strip()
+                            res = __event_emitter__(
+                                {
+                                    "type": "citation",
+                                    "data": {
+                                        "document": [content],
+                                        "metadata": [{"source": url}],
+                                        "source": {"name": title, "url": url},
+                                    },
+                                }
+                            )
+                            if asyncio.iscoroutine(res):
+                                await res
+                        if out_format == "text":
+                            return self._format_web_results_text(items)
+                except Exception:
+                    pass
+
             return body
         except Exception as exc:
             return f"Error performing web search: {exc}"
