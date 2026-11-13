@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from typing import Any
 
@@ -211,6 +212,15 @@ def rerank_hits(
                 hit.pop("rerank_text", None)
                 hit["score"] = float(score)
                 ranked.append((float(score), hit))
+
+            if any(s < 0.0 or s > 1.0 for s, _ in ranked):
+                def _sigmoid(x: float) -> float:
+                    if x >= 0:
+                        return 1.0 / (1.0 + math.exp(-x))
+                    ex = math.exp(x)
+                    return ex / (1.0 + ex)
+
+                ranked = [(_sigmoid(s), {**hit, "score": _sigmoid(s)}) for s, hit in ranked]
 
             ranked.sort(key=lambda item: item[0], reverse=True)
             reranked_hits = [hit for _, hit in ranked]
