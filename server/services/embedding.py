@@ -25,7 +25,7 @@ from server.config import (
     MAX_RETRIES,
     QUERY_PREFIX,
 )
-from server.models.text import clean_normal_text
+from server.models.text import clean_normal_text, clean_passage_snippet, extract_title_from_text
 
 logger = logging.getLogger(__name__)
 
@@ -232,15 +232,16 @@ def _score_chunks(
 
         if doc_id in best and best[doc_id]["distance"] <= distance:
             continue
-        text = chunk_text or ""
-        clean_snip = clean_normal_text(text)
+        text = effective_passage or ""
+        clean_snip = clean_passage_snippet(text, max_chars=900)
+        resolved_title = (title or "").strip() or extract_title_from_text(text, url)
         best[doc_id] = {
             "doc_id": doc_id,
             "distance": distance,
             "score": 1.0 - distance,
             "url": url,
-            "title": title,
-            "snippet": clean_snip[:300].strip(),
+            "title": resolved_title,
+            "snippet": clean_snip,
             "summary": summary or "",
             "published_date": str(doc_date) if doc_date else "",
             "saved_at": str(saved_at) if saved_at else "",
@@ -308,15 +309,16 @@ def _score_chunks_usearch(
 
         if doc_id in best and best[doc_id]["distance"] <= distance:
             continue
-        text = chunk_text or ""
-        clean_snip = clean_normal_text(text)
+        text = effective_passage or ""
+        clean_snip = clean_passage_snippet(text, max_chars=900)
+        resolved_title = (title or "").strip() or extract_title_from_text(text, url)
         best[doc_id] = {
             "doc_id": doc_id,
             "distance": distance,
             "score": 1.0 - distance,
             "url": url,
-            "title": title,
-            "snippet": clean_snip[:300].strip(),
+            "title": resolved_title,
+            "snippet": clean_snip,
             "summary": summary or "",
             "published_date": str(doc_date) if doc_date else "",
             "saved_at": str(saved_at) if saved_at else "",

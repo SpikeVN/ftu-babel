@@ -39,6 +39,7 @@ class WebSearchResultItem(BaseModel):
 class SingleSearchResult(BaseModel):
     """Single search result item."""
     doc_id: int
+    title: str = ""
     url: str
     content: str
     summary: str | None = None

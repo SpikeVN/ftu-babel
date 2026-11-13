@@ -7,12 +7,13 @@ Provides integration with the Babel hybrid knowledge-base search engine:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Literal, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -41,6 +42,7 @@ class Tools:
 
     def __init__(self) -> None:
         self.valves = self.Valves()
+        self.citation = False
 
     def _config(self) -> "Valves":
         """Retrieve tool configuration valves safely."""
@@ -85,16 +87,47 @@ class Tools:
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", errors="replace")
 
-    def babel_query(
+    @staticmethod
+    def _format_results_text(items: list[dict[str, Any]]) -> str:
+        """Format JSON search results into citation-ready plain text with Title and Cite lines."""
+        if not items:
+            return "No results found."
+        blocks: list[str] = []
+        for idx, item in enumerate(items, 1):
+            doc_id = item.get("doc_id", "")
+            title = (item.get("title") or "").strip()
+            url = (item.get("url") or "").strip()
+            score = float(item.get("score") or 0.0)
+            dt = (item.get("date") or "").strip()
+            summary = (item.get("summary") or "").strip()
+            content = (item.get("content") or "").strip()
+            cite_label = (title or url).replace("[", "(").replace("]", ")")
+            lines = [f"[{idx}] Document ID: {doc_id} (Score: {score:.4f})"]
+            if title:
+                lines.append(f"Title: {title}")
+            lines.append(f"URL: {url}")
+            if url:
+                lines.append(f"Cite: [{cite_label}]({url})")
+            if dt:
+                lines.append(f"Date: {dt}")
+            if summary:
+                lines.append(f"Summary (auto-generated): {summary}")
+            if content:
+                lines.append(f"Content:\n{content}")
+            blocks.append("\n".join(lines))
+        return "\n\n---\n\n".join(blocks)
+
+    async def babel_query(
         self,
         query: str,
         mode: Literal["semantic", "keyword", "hybrid"] = "semantic",
         top_k: int = 10,
         format: Literal["text", "json"] = "text",
+        __event_emitter__: Optional[Callable[[dict[str, Any]], Any]] = None,
     ) -> str:
         """
         Search the FTU (Trường Đại học Ngoại thương) knowledge base.
-        Returns relevant document passages with their doc_id, URL, date, summary, and score.
+        Returns relevant document passages with their doc_id, title, URL, Cite link, date, and score.
 
         Args:
             query: The search query string (use user's literal wording, typos included).
@@ -107,7 +140,7 @@ class Tools:
             format: Output format, either 'text' (default, citation-ready plain text for LLM) or 'json'.
 
         Returns:
-            Citation-ready passages with doc_id, URL, publication date, summary, and clean text content.
+            Citation-ready passages with doc_id, Title, URL, Cite link, publication date, summary, and clean text content.
         """
         base_url = self._base_url()
         endpoint = f"{base_url}/query"
@@ -123,20 +156,50 @@ class Tools:
             blend = 0.5
 
         limit = max(1, min(int(top_k), 100))
+        out_format = format if format in ("text", "json") else "text"
+        # Request JSON when emitting native OpenWebUI citations so we can emit per-result source chips
+        req_format = "json" if __event_emitter__ is not None else out_format
         payload = {
             "query": query,
             "limit": limit,
             "hybrid_blend": blend,
-            "format": format if format in ("text", "json") else "text",
+            "format": req_format,
         }
 
         try:
-            status_code, body = self._http_post(endpoint, payload, timeout=60.0)
+            status_code, body = await asyncio.to_thread(self._http_post, endpoint, payload, 60.0)
             if status_code == 404:
                 # Fallback to legacy /search endpoint if /query not yet available
-                status_code, body = self._http_post(f"{base_url}/search", payload, timeout=60.0)
+                status_code, body = await asyncio.to_thread(self._http_post, f"{base_url}/search", payload, 60.0)
             if status_code >= 400:
                 return f"Error {status_code} querying Babel knowledge base: {body}"
+
+            if __event_emitter__ is not None:
+                try:
+                    items = json.loads(body)
+                    if isinstance(items, list):
+                        for item in items:
+                            url = (item.get("url") or "").strip()
+                            title = (item.get("title") or url or f"Document {item.get('doc_id', '')}").strip()
+                            content = (item.get("content") or item.get("summary") or "").strip()
+                            dt = (item.get("date") or "").strip()
+                            res = __event_emitter__(
+                                {
+                                    "type": "citation",
+                                    "data": {
+                                        "document": [content],
+                                        "metadata": [{"source": url, "date": dt, "doc_id": item.get("doc_id")}],
+                                        "source": {"name": title, "url": url},
+                                    },
+                                }
+                            )
+                            if asyncio.iscoroutine(res):
+                                await res
+                        if out_format == "text":
+                            return self._format_results_text(items)
+                except Exception:
+                    pass
+
             return body
         except Exception as exc:
             return f"Error querying Babel knowledge base: {exc}"

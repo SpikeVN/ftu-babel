@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+import urllib.parse
 from typing import Any, Sequence
 
 
@@ -81,6 +82,46 @@ def clean_normal_text(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+_BOILERPLATE_LINE_RE = re.compile(
+    r"^(?:chi tiết|next article.*|prev(?:ious)? article.*|giới thiệu|tin tức|trang chủ)$",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_title_from_text(text: str, url: str = "") -> str:
+    """Extract a clean title from the first markdown heading, or fall back to the URL slug."""
+    if text:
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("#"):
+                heading = clean_normal_text(s.lstrip("#").strip())
+                if heading and not _BOILERPLATE_LINE_RE.match(heading):
+                    return heading[:200]
+    if url:
+        decoded = urllib.parse.unquote(url).rstrip("/")
+        slug = decoded.rsplit("/", 1)[-1]
+        slug = re.sub(r"^\d+-", "", slug)
+        slug = re.sub(r"[-_]+", " ", slug).strip()
+        if slug:
+            return slug[:200]
+    return ""
+
+
+def clean_passage_snippet(text: str, max_chars: int = 900) -> str:
+    """Clean passage text and strip common CMS boilerplate lines before truncating."""
+    cleaned = clean_normal_text(text)
+    if not cleaned:
+        return ""
+    kept: list[str] = []
+    for line in cleaned.splitlines():
+        s = line.strip()
+        if not s or _BOILERPLATE_LINE_RE.match(s) or s in ("(", ")", "[", "]"):
+            continue
+        kept.append(s)
+    joined = "\n".join(kept).strip() or cleaned
+    return joined[:max_chars].strip()
+
+
 def format_search_results_as_text(results: Sequence[Any]) -> str:
     """Format search results into clean, token-efficient plain text for RAG LLM ingestion."""
     if not results:
@@ -89,6 +130,7 @@ def format_search_results_as_text(results: Sequence[Any]) -> str:
     blocks = []
     for idx, r in enumerate(results, 1):
         doc_id = getattr(r, "doc_id", None) or (r.get("doc_id") if isinstance(r, dict) else "")
+        title = getattr(r, "title", None) or (r.get("title") if isinstance(r, dict) else "")
         url = getattr(r, "url", None) or (r.get("url") if isinstance(r, dict) else "")
         score = getattr(r, "score", None) or (r.get("score") if isinstance(r, dict) else 0.0)
         dt = getattr(r, "date", None) or (r.get("date") if isinstance(r, dict) else "")
@@ -96,14 +138,19 @@ def format_search_results_as_text(results: Sequence[Any]) -> str:
         content = getattr(r, "content", None) or (r.get("content") or r.get("snippet") if isinstance(r, dict) else "")
 
         score_val = float(score) if score is not None else 0.0
+        cite_label = (title or extract_title_from_text("", str(url)) or str(url)).replace("[", "(").replace("]", ")")
         lines = [
             f"[{idx}] Document ID: {doc_id} (Score: {score_val:.4f})",
-            f"URL: {url}",
         ]
+        if title:
+            lines.append(f"Title: {title}")
+        lines.append(f"URL: {url}")
+        if url:
+            lines.append(f"Cite: [{cite_label}]({url})")
         if dt:
             lines.append(f"Date: {dt}")
         if summary:
-            lines.append(f"Summary: {summary}")
+            lines.append(f"Summary (auto-generated): {summary}")
         if content:
             lines.append(f"Content:\n{content}")
         blocks.append("\n".join(lines))

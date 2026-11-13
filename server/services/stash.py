@@ -12,8 +12,10 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
+import urllib.parse
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -59,10 +61,28 @@ from server.config import (
 )
 from server.db import SQLiteConnectionPool
 from server.models import Document, SingleSearchResult, StoredCrawlResult, clean_normal_text
+from server.models.text import extract_title_from_text
 from server.services.embedding import score_vector as _score_vector, search_similar as _search_similar
 from server.services.rerank import rerank_hits
 
 logger = logging.getLogger(__name__)
+
+_ARTICLE_ID_RE = re.compile(r"/(\d+)-[^/]+$")
+
+
+def _canonical_doc_key(url: str) -> str:
+    """Normalize URL (decoding percent-encodings and collapsing FTU article ID slugs) for deduplication."""
+    if not url:
+        return ""
+    decoded = urllib.parse.unquote(url).strip()
+    parsed = urllib.parse.urlsplit(decoded)
+    host = parsed.netloc.lower()
+    path = re.sub(r"/+", "/", parsed.path).rstrip("/")
+    m = _ARTICLE_ID_RE.search(path)
+    if m:
+        return f"{host}#article:{m.group(1)}"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{host}{path}{query}"
 
 ColumnSpec = Union[str, ColumnElement[Any]]
 
@@ -308,6 +328,7 @@ class Stash:
         """
         has_rerank_key = RERANK_ENABLED
         candidate_k = max(top_k * 2, ZERANK_CANDIDATE_K) if has_rerank_key else max(top_k * 2, 20)
+        raw_candidate_k = max(candidate_k * 2, 50)
 
         vec_hits: list[dict[str, Any]] = []
         kw_hits: list[dict[str, Any]] = []
@@ -319,7 +340,7 @@ class Stash:
                 try:
                     vec_hits = _search_similar(
                         query_text,
-                        top_k=candidate_k,
+                        top_k=raw_candidate_k,
                         db_path=self.db_path,
                         embed_url=embed_url or DEFAULT_EMBED_URL,
                         include_rerank_text=has_rerank_key,
@@ -333,7 +354,7 @@ class Stash:
                 try:
                     kw_hits = self.search_keyword(
                         query_text,
-                        top_k=candidate_k,
+                        top_k=raw_candidate_k,
                         conn=conn,
                     )
                 except Exception as exc:
@@ -371,10 +392,18 @@ class Stash:
             fused = sorted(candidate_docs.keys(), key=lambda did: rrf_scores[did], reverse=True)
             max_rrf = max(rrf_scores.values()) if rrf_scores else 1.0
             hits: list[dict[str, Any]] = []
-            for did in fused[:candidate_k]:
+            seen_canon_keys: set[str] = set()
+            for did in fused:
                 doc_item = candidate_docs[did]
+                canon_key = _canonical_doc_key(doc_item.get("url", ""))
+                if canon_key and canon_key in seen_canon_keys:
+                    continue
+                if canon_key:
+                    seen_canon_keys.add(canon_key)
                 doc_item["score"] = round(rrf_scores[did] / max_rrf, 4) if max_rrf > 0 else 0.5
                 hits.append(doc_item)
+                if len(hits) >= candidate_k:
+                    break
 
             # 4. Rerank candidates with zerank-2
             if has_rerank_key and hits:
@@ -415,9 +444,13 @@ class Stash:
                 dt = date.fromisoformat(str(raw_date)[:10]) if raw_date else date.today()
             except Exception:
                 dt = date.today()
+            resolved_title = (h.get("title") or "").strip() or extract_title_from_text(
+                h.get("rerank_text") or h.get("snippet") or "", h.get("url", "")
+            )
             out.append(
                 SingleSearchResult(
                     doc_id=h["doc_id"],
+                    title=resolved_title,
                     url=h["url"],
                     content=h.get("snippet", ""),
                     summary=h.get("summary"),
