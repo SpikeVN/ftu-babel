@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sqlite3
+import threading
 import time
 from typing import Any, Sequence
 
 import httpx
+import numpy as np
 import sqlite_vec
 
 from server.config import (
@@ -17,6 +20,7 @@ from server.config import (
     DEFAULT_EMBED_API_KEY,
     DEFAULT_EMBED_MODEL,
     DEFAULT_EMBED_URL,
+    DEFAULT_USEARCH_PATH,
     MAX_EMBED_CHARS,
     MAX_RETRIES,
     QUERY_PREFIX,
@@ -24,6 +28,29 @@ from server.config import (
 from server.models.text import clean_normal_text
 
 logger = logging.getLogger(__name__)
+
+_usearch_index_cache: dict[str, Any] = {}
+_usearch_lock = threading.Lock()
+
+
+def get_usearch_index(index_path: str | None = None) -> Any | None:
+    """Retrieve or memory-map the USearch HNSW vector index (thread-safe singleton)."""
+    path = index_path or DEFAULT_USEARCH_PATH
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    with _usearch_lock:
+        if path in _usearch_index_cache:
+            return _usearch_index_cache[path]
+        try:
+            from usearch.index import Index, MetricKind, ScalarKind
+            index = Index(ndim=768, metric=MetricKind.Cos, dtype=ScalarKind.F16)
+            index.view(path)
+            _usearch_index_cache[path] = index
+            logger.info("Loaded USearch index view from %s (%d keys)", path, len(index))
+            return index
+        except Exception as e:
+            logger.warning("Could not load USearch index from %s: %s", path, e)
+            return None
 
 REGEX_HORIZONTAL_WS = re.compile(r"[ \t]+")
 REGEX_EXCESS_NEWLINES = re.compile(r"\n{3,}")
@@ -151,6 +178,9 @@ def get_shared_embed_client(
     api_key: str = DEFAULT_EMBED_API_KEY,
 ) -> EmbeddingClient:
     """Retrieve or create a persistent keep-alive EmbeddingClient."""
+    # Keyless for local endpoints
+    if "127.0.0.1" in endpoint_url or "localhost" in endpoint_url:
+        api_key = ""
     key = (endpoint_url, model_name, api_key)
     client = _cached_embed_clients.get(key)
     if client is None or client._client.is_closed:
@@ -165,7 +195,7 @@ def _score_chunks(
     top_k: int,
     include_rerank_text: bool,
 ) -> list[dict[str, Any]]:
-    """kNN over chunk vectors, keeping each document's best-matching chunk and summary."""
+    """kNN over chunk vectors, keeping each document's best-matching chunk, resolving parent context, and summary."""
     chunk_k = max(top_k * CHUNK_FANOUT, top_k)
     query = """
     SELECT
@@ -178,10 +208,12 @@ def _score_chunks(
         COALESCE(json_extract(s.metadata, '$.title'), '') AS title,
         COALESCE(ds.summary, '') AS summary,
         COALESCE(ds.published_date, substr(s.saved_at, 1, 10)) AS doc_date,
-        s.saved_at
+        s.saved_at,
+        COALESCE(p.chunk_text, c.chunk_text) AS parent_text
     FROM vec_chunks v
     JOIN document_chunks c ON c.chunk_id = v.chunk_id
-    JOIN storedcrawlresult s ON s.id = c.doc_id
+    LEFT JOIN document_chunks p ON p.chunk_id = c.parent_chunk_id
+    JOIN documents s ON s.id = c.doc_id
     LEFT JOIN document_summaries ds ON ds.doc_id = c.doc_id
     WHERE v.embedding MATCH ? AND k = ?
     ORDER BY v.distance ASC
@@ -189,10 +221,15 @@ def _score_chunks(
     rows = conn.execute(query, (serialized_vec, chunk_k)).fetchall()
 
     best: dict[int, dict[str, Any]] = {}
-    context: dict[int, list[tuple[float, str]]] = {}
-    for _chunk_id, distance, doc_id, chunk_text, _chunk_index, url, title, summary, doc_date, saved_at in rows:
+    context: dict[int, dict[str, float]] = {}  # doc_id -> {passage_text: best_distance}
+    for _chunk_id, distance, doc_id, chunk_text, _chunk_index, url, title, summary, doc_date, saved_at, parent_text in rows:
         distance = float(distance)
-        context.setdefault(doc_id, []).append((distance, chunk_text or ""))
+        effective_passage = (parent_text or chunk_text or "").strip()
+        if effective_passage:
+            curr_passages = context.setdefault(doc_id, {})
+            if effective_passage not in curr_passages or distance < curr_passages[effective_passage]:
+                curr_passages[effective_passage] = distance
+
         if doc_id in best and best[doc_id]["distance"] <= distance:
             continue
         text = chunk_text or ""
@@ -212,7 +249,85 @@ def _score_chunks(
     results = sorted(best.values(), key=lambda r: r["distance"])[:top_k]
     if include_rerank_text:
         for result in results:
-            passages = [t for _, t in sorted(context[result["doc_id"]])[:3]]
+            doc_passages = context.get(result["doc_id"], {})
+            sorted_passages = sorted(doc_passages.items(), key=lambda item: item[1])
+            passages = [p for p, _ in sorted_passages[:3]]
+            result["rerank_text"] = "\n\n".join(passages)[:8000]
+    return results
+
+
+def _score_chunks_usearch(
+    conn: sqlite3.Connection,
+    vector: Sequence[float],
+    top_k: int,
+    include_rerank_text: bool,
+    index: Any,
+) -> list[dict[str, Any]]:
+    """Ultra-fast kNN over USearch HNSW index, resolving chunk/parent context via indexed SQLite query."""
+    chunk_k = max(top_k * CHUNK_FANOUT, top_k)
+    q_vec = np.asarray(vector, dtype=np.float32)
+    matches = index.search(q_vec, chunk_k)
+
+    if len(matches) == 0:
+        return []
+
+    chunk_ids = [int(k) for k in matches.keys]
+    distances = {int(k): float(d) for k, d in zip(matches.keys, matches.distances)}
+
+    placeholders = ",".join("?" for _ in chunk_ids)
+    query = f"""
+    SELECT
+        c.chunk_id,
+        c.doc_id,
+        c.chunk_text,
+        c.chunk_index,
+        s.url,
+        COALESCE(json_extract(s.metadata, '$.title'), '') AS title,
+        COALESCE(ds.summary, '') AS summary,
+        COALESCE(ds.published_date, substr(s.saved_at, 1, 10)) AS doc_date,
+        s.saved_at,
+        COALESCE(p.chunk_text, c.chunk_text) AS parent_text
+    FROM document_chunks c
+    LEFT JOIN document_chunks p ON p.chunk_id = c.parent_chunk_id
+    JOIN documents s ON s.id = c.doc_id
+    LEFT JOIN document_summaries ds ON ds.doc_id = c.doc_id
+    WHERE c.chunk_id IN ({placeholders})
+    """
+    rows = conn.execute(query, chunk_ids).fetchall()
+
+    best: dict[int, dict[str, Any]] = {}
+    context: dict[int, dict[str, float]] = {}
+
+    for chunk_id, doc_id, chunk_text, _chunk_index, url, title, summary, doc_date, saved_at, parent_text in rows:
+        distance = distances.get(chunk_id, 1.0)
+        effective_passage = (parent_text or chunk_text or "").strip()
+        if effective_passage:
+            curr_passages = context.setdefault(doc_id, {})
+            if effective_passage not in curr_passages or distance < curr_passages[effective_passage]:
+                curr_passages[effective_passage] = distance
+
+        if doc_id in best and best[doc_id]["distance"] <= distance:
+            continue
+        text = chunk_text or ""
+        clean_snip = clean_normal_text(text)
+        best[doc_id] = {
+            "doc_id": doc_id,
+            "distance": distance,
+            "score": 1.0 - distance,
+            "url": url,
+            "title": title,
+            "snippet": clean_snip[:300].strip(),
+            "summary": summary or "",
+            "published_date": str(doc_date) if doc_date else "",
+            "saved_at": str(saved_at) if saved_at else "",
+        }
+
+    results = sorted(best.values(), key=lambda r: r["distance"])[:top_k]
+    if include_rerank_text:
+        for result in results:
+            doc_passages = context.get(result["doc_id"], {})
+            sorted_passages = sorted(doc_passages.items(), key=lambda item: item[1])
+            passages = [p for p, _ in sorted_passages[:3]]
             result["rerank_text"] = "\n\n".join(passages)[:8000]
     return results
 
@@ -236,7 +351,7 @@ def _score_documents(
         substr(s.markdown, 1, 300) AS snippet{rerank_text_column},
         s.saved_at
     FROM vec_documents v
-    JOIN storedcrawlresult s ON s.id = v.doc_id
+    JOIN documents s ON s.id = v.doc_id
     WHERE v.embedding MATCH ? AND k = ?
     ORDER BY v.distance ASC
     """.format(
@@ -275,17 +390,13 @@ def score_vector(
     include_rerank_text: bool = False,
     conn: sqlite3.Connection | None = None,
 ) -> list[dict[str, Any]]:
-    """Score documents against a given float vector using sqlite-vec."""
+    """Score documents against a given float vector using USearch (fast) or sqlite-vec (fallback)."""
     should_close = False
     if conn is None:
         conn = sqlite3.connect(db_path, timeout=60.0)
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
         should_close = True
 
     try:
-        serialized_vec = sqlite_vec.serialize_float32(list(vector))
         has_chunks = False
         try:
             row = conn.execute("SELECT EXISTS(SELECT 1 FROM document_chunks)").fetchone()
@@ -293,6 +404,17 @@ def score_vector(
                 has_chunks = True
         except Exception:
             pass
+
+        # Try ultra-fast USearch index first
+        usearch_idx = get_usearch_index()
+        if usearch_idx is not None and has_chunks:
+            return _score_chunks_usearch(conn, vector, top_k, include_rerank_text, usearch_idx)
+
+        # Fallback to sqlite-vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        serialized_vec = sqlite_vec.serialize_float32(list(vector))
 
         if has_chunks:
             results = _score_chunks(conn, serialized_vec, top_k, include_rerank_text)

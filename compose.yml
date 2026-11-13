@@ -8,6 +8,10 @@ services:
     environment:
       - PORT=8000
       - STASH_DB_PATH=/app/data/stash.db
+      - USEARCH_INDEX_PATH=/app/data/stash.usearch
+      - MOSS_API_KEY=${MOSS_API_KEY:-}
+      - MOSS_EMBEDDING_ENDPOINT=${MOSS_EMBEDDING_ENDPOINT:-}
+      - MOSS_RERANKING_ENDPOINT=${MOSS_RERANKING_ENDPOINT:-}
       - FTULABS_API_ENDPOINT=${FTULABS_API_ENDPOINT:-}
       - FTULABS_API_KEY=${FTULABS_API_KEY:-}
       - ZEROENTROPY_API_KEY=${ZEROENTROPY_API_KEY:-}
@@ -16,8 +20,9 @@ services:
     env_file:
       - .env
     volumes:
-      # Mount the database file into the writable /app/data directory.
+      # Mount the database and vector index into the writable /app/data directory.
       - ./stash.db:/app/data/stash.db:rw
+      - ./stash.usearch:/app/data/stash.usearch:rw
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8000/" ]
       interval: 30s

@@ -3,6 +3,9 @@
 from server.config import (
     FTULABS_API_ENDPOINT,
     FTULABS_API_KEY,
+    MOSS_API_KEY,
+    MOSS_EMBEDDING_ENDPOINT,
+    MOSS_RERANKING_ENDPOINT,
     ZERANK_CANDIDATE_K,
     ZERANK_MODEL,
     ZERANK_TIMEOUT,
@@ -15,6 +18,9 @@ from server.services.rerank import (
 )
 
 __all__ = [
+    "MOSS_API_KEY",
+    "MOSS_EMBEDDING_ENDPOINT",
+    "MOSS_RERANKING_ENDPOINT",
     "FTULABS_API_ENDPOINT",
     "FTULABS_API_KEY",
     "ZEROENTROPY_API_KEY",

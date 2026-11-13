@@ -10,11 +10,14 @@ from typing import Any
 import httpx
 
 from server.config import (
-    ZEROENTROPY_API_KEY,
-    ZEROENTROPY_BASE_URL,
+    MOSS_API_KEY,
+    MOSS_RERANKING_ENDPOINT,
     ZERANK_CANDIDATE_K,
     ZERANK_MODEL,
     ZERANK_TIMEOUT,
+    ZEROENTROPY_API_KEY,
+    ZEROENTROPY_BASE_URL,
+    _is_local_endpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,32 @@ def get_shared_rerank_client() -> httpx.Client:
     return _shared_rerank_client
 
 
+def build_rerank_document(hit: dict[str, Any], max_chars: int = 3500) -> str:
+    """
+    Construct a high-signal candidate document combining title, summary, and rerank_text/snippet.
+    Prioritizes detailed chunk/passage content (rerank_text) over high-level 1-sentence summaries,
+    while still including title and summary for macro context.
+    """
+    title = (hit.get("title") or "").strip()
+    summary = (hit.get("summary") or "").strip()
+    rerank_text = (hit.get("rerank_text") or hit.get("snippet") or "").strip()
+
+    parts: list[str] = []
+    if title:
+        parts.append(f"Tiêu đề: {title}")
+    if summary and summary != rerank_text:
+        parts.append(f"Tóm tắt: {summary}")
+    if rerank_text:
+        parts.append(f"Nội dung: {rerank_text}")
+
+    if not parts:
+        combined = str(hit.get("snippet") or hit.get("url") or "")
+    else:
+        combined = "\n".join(parts)
+
+    return combined[:max_chars].strip()
+
+
 def _rerank_with_completion(
     query: str,
     hits: list[dict[str, Any]],
@@ -49,10 +78,8 @@ def _rerank_with_completion(
     id_map = {}
     for idx, hit in enumerate(candidates_to_rank, 1):
         id_map[idx] = hit
-        title = hit.get("title") or ""
-        snippet = hit.get("snippet") or hit.get("rerank_text") or ""
-        text = f"{title} - {snippet}" if title else snippet
-        doc_entries.append(f"[{idx}] {text[:250].strip()}")
+        text = build_rerank_document(hit, max_chars=1500)
+        doc_entries.append(f"[{idx}] {text}")
 
     prompt = f"""Bạn là bộ máy xếp hạng tìm kiếm (reranker).
 Nhiệm vụ: Đánh giá mức độ liên quan của các tài liệu ứng viên với câu truy vấn.
@@ -126,14 +153,14 @@ def rerank_hits(
     """Reorder search candidates by relevance using zerank-2."""
     if not hits:
         return []
-    if not api_key:
+    if not api_key and not _is_local_endpoint(base_url):
         raise ValueError(
-            "Set FTULABS_API_KEY or ZEROENTROPY_API_KEY to rerank search results."
+            "Set MOSS_API_KEY or ZEROENTROPY_API_KEY to rerank search results."
         )
 
     candidates = hits[:min(len(hits), max(top_k, 12))]
     documents = [
-        str(hit.get("summary") or hit.get("rerank_text") or hit.get("snippet") or "")[:600]
+        build_rerank_document(hit, max_chars=2500)
         for hit in candidates
     ]
 

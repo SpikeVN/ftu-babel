@@ -113,7 +113,7 @@ def init_summary_tables(conn: sqlite3.Connection) -> None:
             topics TEXT,
             model_name TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (doc_id) REFERENCES storedcrawlresult(id) ON DELETE CASCADE
+            FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
         )
         """
     )
@@ -371,7 +371,7 @@ def run_summarization(
     if skip_existing:
         query = """
             SELECT s.id, s.url, s.html, s.markdown, COALESCE(json_extract(s.metadata, '$.title'), '')
-            FROM storedcrawlresult s
+            FROM documents s
             WHERE length(s.markdown) > 0
               AND s.id NOT IN (SELECT doc_id FROM document_summaries)
             ORDER BY s.id
@@ -379,7 +379,7 @@ def run_summarization(
     else:
         query = """
             SELECT s.id, s.url, s.html, s.markdown, COALESCE(json_extract(s.metadata, '$.title'), '')
-            FROM storedcrawlresult s
+            FROM documents s
             WHERE length(s.markdown) > 0
             ORDER BY s.id
         """
@@ -599,7 +599,7 @@ def search_summaries(
         v.distance
     FROM vec_summaries v
     JOIN document_summaries s ON s.doc_id = v.doc_id
-    JOIN storedcrawlresult c ON c.id = s.doc_id
+    JOIN documents c ON c.id = s.doc_id
     WHERE v.embedding MATCH ? AND k = ?
     ORDER BY v.distance ASC
     """

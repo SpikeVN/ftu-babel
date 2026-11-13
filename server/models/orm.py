@@ -27,9 +27,9 @@ class Base(DeclarativeBase):
 class Document(Base):
     """
     SQLAlchemy ORM model representing a crawled document stored in the database.
-    Corresponds to the 'storedcrawlresult' table.
+    Corresponds to the 'documents' table.
     """
-    __tablename__ = "storedcrawlresult"
+    __tablename__ = "documents"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     url: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)

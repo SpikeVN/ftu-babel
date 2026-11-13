@@ -2,7 +2,7 @@
 embed_stash.py - Vector Embedding Pipeline & Scoring with sqlite-vec.
 
 Embeds documents (their markdown version) from stash.db using the EmbeddingGemma model
-served by the FTULabs gateway (FTULABS_API_ENDPOINT/v1/embeddings), and indexes &
+served by the MOSS gateway (MOSS_EMBEDDING_ENDPOINT/embeddings), and indexes &
 scores vectors using sqlite-vec with cosine similarity.
 """
 
@@ -48,13 +48,31 @@ try:
     DEFAULT_BATCH_SIZE = DEFAULT_EMBED_BATCH_SIZE
 except ImportError:
     DEFAULT_DB_PATH = "stash.db"
-    FTULABS_API_ENDPOINT = os.environ.get("FTULABS_API_ENDPOINT", "").rstrip("/")
+    MOSS_API_KEY = os.environ.get("MOSS_API_KEY") or os.environ.get("FTULABS_API_KEY", "")
+    MOSS_EMBEDDING_ENDPOINT = (
+        os.environ.get("MOSS_EMBEDDING_ENDPOINT")
+        or os.environ.get("FTULABS_API_ENDPOINT", "")
+    ).rstrip("/")
+    FTULABS_API_ENDPOINT = MOSS_EMBEDDING_ENDPOINT
+    FTULABS_API_KEY = MOSS_API_KEY
+
+    def _join_endpoint(base: str, path: str) -> str:
+        base = base.rstrip("/")
+        path = path.lstrip("/")
+        if base.endswith("/v1") and path.startswith("v1/"):
+            path = path[3:]
+        elif not base.endswith("/v1") and not path.startswith("v1/"):
+            path = f"v1/{path}"
+        return f"{base}/{path}" if base else ""
+
     DEFAULT_EMBED_URL = os.environ.get(
         "EMBED_URL",
-        f"{FTULABS_API_ENDPOINT}/embeddings" if FTULABS_API_ENDPOINT else "http://ml:8085/v1/embeddings",
+        _join_endpoint(MOSS_EMBEDDING_ENDPOINT, "embeddings")
+        if MOSS_EMBEDDING_ENDPOINT
+        else "http://ml:8085/v1/embeddings",
     )
     DEFAULT_MODEL = os.environ.get("EMBED_MODEL", "unsloth/embeddinggemma-2-GGUF")
-    DEFAULT_API_KEY = os.environ.get("EMBED_API_KEY") or os.environ.get("FTULABS_API_KEY", "")
+    DEFAULT_API_KEY = os.environ.get("EMBED_API_KEY") or MOSS_API_KEY
     DEFAULT_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "64"))
     DEFAULT_CHUNK_BATCH_SIZE = int(os.environ.get("EMBED_CHUNK_BATCH_SIZE", "16"))
     DEFAULT_CONCURRENCY = int(os.environ.get("EMBED_CONCURRENCY", "4"))
@@ -153,8 +171,65 @@ def split_into_chunks(
     return chunks
 
 
+def build_contextual_prefix(title: str = "", doc_date: str = "", summary: str = "") -> str:
+    """
+    Build lightweight deterministic contextual prefix to prepend to child chunks.
+    Anchors micro-chunks to document identity, preventing semantic dilution.
+    """
+    elements: list[str] = []
+    if title:
+        elements.append(f"Tài liệu: {title.strip()}")
+    if doc_date:
+        elements.append(f"Ngày: {str(doc_date)[:10].strip()}")
+    if not elements:
+        return ""
+    return f"[{' | '.join(elements)}] "
+
+
+def split_into_hierarchical_chunks(
+    text: str,
+    parent_chars: int = 3000,
+    parent_overlap: int = 300,
+    child_chars: int = 500,
+    child_overlap: int = 100,
+) -> list[dict[str, Any]]:
+    """
+    Hierarchical chunking: splits document into enclosing parent sections (~3,000 chars)
+    and micro child chunks (~500 chars) linked to their parent.
+    Returns a list of dicts:
+      [
+        {
+          "parent_index": int,
+          "parent_text": str,
+          "children": [
+            {"child_index": int, "child_text": str}, ...
+          ]
+        }, ...
+      ]
+    """
+    if not text or not text.strip():
+        return []
+
+    parent_units = split_into_chunks(text, max_chars=parent_chars, overlap=parent_overlap)
+    hierarchical_data: list[dict[str, Any]] = []
+
+    for p_idx, p_text in enumerate(parent_units):
+        child_units = split_into_chunks(p_text, max_chars=child_chars, overlap=child_overlap)
+        children = [
+            {"child_index": c_idx, "child_text": c_text}
+            for c_idx, c_text in enumerate(child_units)
+        ]
+        hierarchical_data.append({
+            "parent_index": p_idx,
+            "parent_text": p_text,
+            "children": children,
+        })
+
+    return hierarchical_data
+
+
 class EmbeddingClient:
-    """Client for an OpenAI-compatible embeddings API (FTULabs gateway / llama.cpp)."""
+    """Client for an OpenAI-compatible embeddings API (MOSS gateway / llama.cpp)."""
 
     def __init__(
         self,
@@ -277,12 +352,23 @@ def init_chunk_tables(conn: sqlite3.Connection) -> None:
             chunk_index INTEGER NOT NULL,
             chunk_text TEXT NOT NULL,
             token_count INTEGER,
-            FOREIGN KEY (doc_id) REFERENCES storedcrawlresult(id)
+            parent_chunk_id INTEGER,
+            chunk_type TEXT DEFAULT 'child',
+            FOREIGN KEY (doc_id) REFERENCES documents(id)
         )
         """
     )
+    cursor = conn.cursor()
+    cols = {r[1] for r in cursor.execute("PRAGMA table_info(document_chunks)").fetchall()}
+    if "parent_chunk_id" not in cols:
+        cursor.execute("ALTER TABLE document_chunks ADD COLUMN parent_chunk_id INTEGER")
+    if "chunk_type" not in cols:
+        cursor.execute("ALTER TABLE document_chunks ADD COLUMN chunk_type TEXT DEFAULT 'child'")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_document_chunks_doc ON document_chunks(doc_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_chunks_parent ON document_chunks(parent_chunk_id)"
     )
     conn.execute(
         f"""
@@ -349,8 +435,9 @@ def run_embedding_for_all_documents(
         cursor.execute(
             """
             SELECT s.id, s.markdown
-            FROM storedcrawlresult s
+            FROM documents s
             WHERE length(s.markdown) > 0
+              AND (s.id NOT IN (SELECT doc_id FROM document_stubs) OR s.id IN (SELECT doc_id FROM document_stubs WHERE status = 'extracted'))
               AND s.id NOT IN (SELECT doc_id FROM vec_documents)
             ORDER BY s.id
             """
@@ -359,7 +446,7 @@ def run_embedding_for_all_documents(
         cursor.execute(
             """
             SELECT s.id, s.markdown
-            FROM storedcrawlresult s
+            FROM documents s
             WHERE length(s.markdown) > 0
             ORDER BY s.id
             """
@@ -501,8 +588,9 @@ def run_chunk_embedding(
         cursor.execute(
             """
             SELECT s.id, s.markdown
-            FROM storedcrawlresult s
+            FROM documents s
             WHERE length(s.markdown) > 0
+              AND (s.id NOT IN (SELECT doc_id FROM document_stubs) OR s.id IN (SELECT doc_id FROM document_stubs WHERE status = 'extracted'))
               AND s.id NOT IN (SELECT DISTINCT doc_id FROM document_chunks)
             ORDER BY s.id
             """
@@ -511,7 +599,7 @@ def run_chunk_embedding(
         cursor.execute(
             """
             SELECT s.id, s.markdown
-            FROM storedcrawlresult s
+            FROM documents s
             WHERE length(s.markdown) > 0
             ORDER BY s.id
             """
@@ -653,6 +741,213 @@ def run_chunk_embedding(
     return {"docs": total_docs, "chunks": chunk_count}
 
 
+def run_hierarchical_chunk_embedding(
+    db_path: str = DEFAULT_DB_PATH,
+    embed_url: str = DEFAULT_EMBED_URL,
+    batch_size: int = DEFAULT_CHUNK_BATCH_SIZE,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    skip_existing: bool = True,
+    limit: int | None = None,
+    verbose: bool = True,
+    model_name: str = DEFAULT_MODEL,
+    api_key: str = DEFAULT_API_KEY,
+    parent_chars: int = 3000,
+    parent_overlap: int = 300,
+    child_chars: int = 500,
+    child_overlap: int = 100,
+    use_context_prefix: bool = True,
+) -> dict[str, int]:
+    """
+    Hierarchical 'Small-to-Big' chunking & embedding pipeline:
+    - Splits document into enclosing Parent sections (~3,000 chars) for reference and reranking.
+    - Generates micro Child chunks (~500 chars) linked to parent_chunk_id.
+    - Prepends document situational context ([Tài liệu: ... | Ngày: ...]) to child chunks.
+    - Embeds only Child chunks into vec_chunks via the 4B model at embed_url.
+    """
+    if "127.0.0.1" in embed_url or "localhost" in embed_url:
+        api_key = ""
+
+    client = EmbeddingClient(
+        endpoint_url=embed_url,
+        model_name=model_name,
+        api_key=api_key,
+        max_chars=child_chars + child_overlap + len(DOC_PREFIX) + 200,
+    )
+    conn = get_vec_connection(db_path)
+    conn.execute("PRAGMA synchronous=NORMAL")
+    cursor = conn.cursor()
+
+    query = """
+    SELECT
+        s.id,
+        s.markdown,
+        COALESCE(json_extract(s.metadata, '$.title'), '') AS title,
+        COALESCE(ds.published_date, substr(s.saved_at, 1, 10)) AS doc_date
+    FROM documents s
+    LEFT JOIN document_summaries ds ON ds.doc_id = s.id
+    WHERE length(s.markdown) > 0
+      AND (s.id NOT IN (SELECT doc_id FROM document_stubs) OR s.id IN (SELECT doc_id FROM document_stubs WHERE status = 'extracted'))
+    """
+    if skip_existing:
+        query += " AND s.id NOT IN (SELECT DISTINCT doc_id FROM document_chunks WHERE parent_chunk_id IS NOT NULL)"
+    query += " ORDER BY s.id"
+
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    if limit is not None:
+        rows = rows[:limit]
+    total_docs = len(rows)
+
+    if verbose:
+        existing_chunks = cursor.execute("SELECT count(*) FROM document_chunks").fetchone()[0]
+        print(f"Hierarchical chunk-embedding {total_docs} documents via {embed_url}...")
+        print(
+            f"{existing_chunks} existing chunks | parent={parent_chars} chars, "
+            f"child={child_chars} chars, batch={batch_size}, concurrency={concurrency}"
+        )
+
+    if total_docs == 0:
+        if verbose:
+            print("All documents are already hierarchically chunked!")
+        conn.close()
+        client.close()
+        return {"docs": 0, "chunks": 0}
+
+    def delete_doc_chunks(doc_id: int) -> None:
+        stale = [r[0] for r in conn.execute(
+            "SELECT chunk_id FROM document_chunks WHERE doc_id = ?", (doc_id,)
+        )]
+        if stale:
+            placeholders = ",".join("?" * len(stale))
+            conn.execute(f"DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})", stale)
+            conn.execute("DELETE FROM document_chunks WHERE doc_id = ?", (doc_id,))
+
+    def iter_batches():
+        """Yield (items, docs_in_batch) where items are (chunk_id, embed_text) pairs."""
+        buf: list[tuple[int, str]] = []
+        docs_in_buf = 0
+        for doc_id, markdown, title, doc_date in rows:
+            delete_doc_chunks(doc_id)
+            context_prefix = build_contextual_prefix(title, doc_date) if use_context_prefix else ""
+            h_data = split_into_hierarchical_chunks(
+                markdown,
+                parent_chars=parent_chars,
+                parent_overlap=parent_overlap,
+                child_chars=child_chars,
+                child_overlap=child_overlap,
+            )
+            for p_item in h_data:
+                # 1. Insert parent chunk
+                p_text = p_item["parent_text"]
+                cur_p = conn.execute(
+                    "INSERT INTO document_chunks(doc_id, chunk_index, chunk_text, token_count, parent_chunk_id, chunk_type)"
+                    " VALUES (?, ?, ?, ?, NULL, 'parent')",
+                    (doc_id, p_item["parent_index"], p_text, len(p_text) // 4),
+                )
+                parent_id = cur_p.lastrowid
+
+                # 2. Insert child chunks linked to parent
+                for c_item in p_item["children"]:
+                    c_text = c_item["child_text"]
+                    embed_text = f"{context_prefix}{c_text}".strip()
+                    cur_c = conn.execute(
+                        "INSERT INTO document_chunks(doc_id, chunk_index, chunk_text, token_count, parent_chunk_id, chunk_type)"
+                        " VALUES (?, ?, ?, ?, ?, 'child')",
+                        (doc_id, c_item["child_index"], c_text, len(c_text) // 4, parent_id),
+                    )
+                    buf.append((cur_c.lastrowid, embed_text))
+                    if len(buf) >= batch_size:
+                        yield buf, docs_in_buf
+                        buf, docs_in_buf = [], 0
+            docs_in_buf += 1
+        if buf or docs_in_buf:
+            yield buf, docs_in_buf
+
+    pbar = tqdm(
+        total=total_docs,
+        disable=not verbose,
+        unit="doc",
+        desc="Hierarchical Chunking",
+        mininterval=1.0,
+        smoothing=0.05,
+        dynamic_ncols=True,
+        file=sys.stderr,
+        bar_format=(
+            "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} docs "
+            "[{elapsed}<{remaining}, {rate_fmt}]{postfix}"
+        ),
+    )
+    start_time = time.time()
+    chunk_count = 0
+
+    def write_chunk_vectors(
+        items: Sequence[tuple[int, str]],
+        embeddings: list[list[float]],
+        docs_done: int,
+    ) -> None:
+        nonlocal chunk_count
+        if items:
+            chunk_ids = [cid for cid, _ in items]
+            insert_data = [
+                (cid, sqlite_vec.serialize_float32(emb))
+                for cid, emb in zip(chunk_ids, embeddings)
+            ]
+            placeholders = ",".join("?" * len(chunk_ids))
+            conn.execute(f"DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})", chunk_ids)
+            conn.executemany(
+                "INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)",
+                insert_data,
+            )
+            chunk_count += len(items)
+        conn.commit()
+
+        pbar.update(docs_done)
+        elapsed_now = time.time() - start_time
+        rate = chunk_count / elapsed_now if elapsed_now > 0 else 0
+        pbar.set_postfix_str(f"children={chunk_count} {rate:.1f} chunk/s", refresh=True)
+
+    try:
+        if concurrency <= 1:
+            for items, docs_done in iter_batches():
+                write_chunk_vectors(
+                    items,
+                    client.embed_batch([DOC_PREFIX + t for _, t in items]),
+                    docs_done,
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                pending: deque[tuple[Sequence[tuple[int, str]], Any, int]] = deque()
+                for items, docs_done in iter_batches():
+                    pending.append(
+                        (
+                            items,
+                            pool.submit(client.embed_batch, [DOC_PREFIX + t for _, t in items]),
+                            docs_done,
+                        )
+                    )
+                    while len(pending) > concurrency:
+                        done_items, done_future, docs_in_batch = pending.popleft()
+                        write_chunk_vectors(done_items, done_future.result(), docs_in_batch)
+                while pending:
+                    done_items, done_future, docs_in_batch = pending.popleft()
+                    write_chunk_vectors(done_items, done_future.result(), docs_in_batch)
+
+    finally:
+        pbar.close()
+        conn.close()
+        client.close()
+
+    elapsed = time.time() - start_time
+    rate = chunk_count / elapsed if elapsed > 0 else 0
+    if verbose:
+        print(
+            f"Finished hierarchical chunk-embedding {total_docs} documents into {chunk_count} child chunks "
+            f"in {elapsed:.2f}s ({rate:.1f} chunk/s)."
+        )
+
+    return {"docs": total_docs, "chunks": chunk_count}
+
+
 _cached_embed_clients: dict[tuple[str, str, str], EmbeddingClient] = {}
 
 
@@ -725,7 +1020,7 @@ def _score_chunks(
         s.saved_at
     FROM vec_chunks v
     JOIN document_chunks c ON c.chunk_id = v.chunk_id
-    JOIN storedcrawlresult s ON s.id = c.doc_id
+    JOIN documents s ON s.id = c.doc_id
     LEFT JOIN document_summaries ds ON ds.doc_id = c.doc_id
     WHERE v.embedding MATCH ? AND k = ?
     ORDER BY v.distance ASC
@@ -784,7 +1079,7 @@ def _score_documents(
         substr(s.markdown, 1, 300) AS snippet{rerank_text_column},
         s.saved_at
     FROM vec_documents v
-    JOIN storedcrawlresult s ON s.id = v.doc_id
+    JOIN documents s ON s.id = v.doc_id
     WHERE v.embedding MATCH ? AND k = ?
     ORDER BY v.distance ASC
     """.format(
@@ -879,14 +1174,27 @@ def main() -> None:
     parser.add_argument(
         "--api-key",
         default=DEFAULT_API_KEY,
-        help="API key for embeddings endpoint (default: env EMBED_API_KEY / FTULABS_API_KEY)",
+        help="API key for embeddings endpoint (default: env EMBED_API_KEY / MOSS_API_KEY)",
     )
     parser.add_argument(
         "--mode",
-        choices=("chunks", "docs"),
+        choices=("chunks", "hierarchical", "docs"),
         default="chunks",
         help="chunks: index every passage into vec_chunks (default); "
+        "hierarchical: small-to-big child-parent chunking with contextual prefixes; "
         "docs: one truncated vector per document into vec_documents",
+    )
+    parser.add_argument(
+        "--parent-chars",
+        type=int,
+        default=3000,
+        help="Characters per parent chunk in hierarchical mode (default: 3000)",
+    )
+    parser.add_argument(
+        "--child-chars",
+        type=int,
+        default=500,
+        help="Characters per child chunk in hierarchical mode (default: 500)",
     )
     parser.add_argument(
         "--chunk-chars",
@@ -940,6 +1248,20 @@ def main() -> None:
             print(f"\n[{i}] Doc ID: {hit['doc_id']} | Score: {hit['score']:.4f} (distance: {hit['distance']:.4f})")
             print(f"    URL: {hit['url']}")
             print(f"    Snippet: {hit['snippet'][:120]}...")
+    elif args.mode == "hierarchical":
+        run_hierarchical_chunk_embedding(
+            db_path=args.db,
+            embed_url=args.embed_url,
+            batch_size=args.batch_size or 64,
+            concurrency=args.concurrency,
+            skip_existing=not args.reindex_all,
+            limit=args.limit,
+            verbose=True,
+            model_name=args.model,
+            api_key=args.api_key,
+            parent_chars=args.parent_chars,
+            child_chars=args.child_chars,
+        )
     elif args.mode == "chunks":
         run_chunk_embedding(
             db_path=args.db,

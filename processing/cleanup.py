@@ -18,6 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import urlparse
 
 import html2text
 from tqdm import tqdm
@@ -28,6 +29,77 @@ except ImportError:
     DEFAULT_DB_PATH = "stash.db"
 
 logger = logging.getLogger(__name__)
+
+# Known spam keywords and gambling domains injected via SEO hacks
+SPAM_DOMAINS = [
+    "casimbanz.com",
+    "casino777esp.com",
+    "casinoazurfrance.com",
+    "casinodaysnz.com",
+    "casinoextraavis.com",
+    "casimba.com",
+    "kubet",
+    "thabet",
+    "789bet",
+    "hi88",
+    "jun88",
+    "new88",
+    "shbet",
+]
+
+SPAM_KEYWORDS = [
+    r"\bcasimba\b",
+    r"\bcasino777\b",
+    r"\bazurcasino\b",
+    r"\bextra casino\b",
+    r"\bcasino days\b",
+    r"\bkèo nhà cái\b",
+    r"\bđá gà thomo\b",
+    r"\bđá gà trực tiếp\b",
+    r"\bsoi cầu\b",
+    r"\bgame bài đổi thưởng\b",
+    r"\bnổ hũ\b",
+    r"\bcá cược bóng đá\b",
+    r"\bbaccarat online\b",
+]
+
+COMPILED_SPAM_PATTERNS = [re.compile(p, re.IGNORECASE) for p in SPAM_KEYWORDS]
+
+
+def is_valid_domain(url: str) -> bool:
+    """Validate whether the URL belongs to an official FTU university domain."""
+    if not url:
+        return False
+    try:
+        netloc = urlparse(url).netloc.lower()
+        if ":" in netloc:
+            netloc = netloc.split(":")[0]
+        return netloc.endswith("ftu.edu.vn") or netloc == "ftu.edu.vn"
+    except Exception:
+        return False
+
+
+def validate_content(text: str, url: str = "") -> tuple[bool, str]:
+    """
+    Ingestion gatekeeper: Validate whether text and URL pass domain and spam checks.
+    Returns (is_valid, reason).
+    """
+    if url and not is_valid_domain(url):
+        return False, f"Unauthorized non-FTU domain: {url}"
+
+    lower_text = text.lower() if text else ""
+    lower_url = url.lower() if url else ""
+
+    for domain in SPAM_DOMAINS:
+        if domain in lower_url or domain in lower_text:
+            return False, f"Blacklisted gambling/spam domain: {domain}"
+
+    for pat in COMPILED_SPAM_PATTERNS:
+        m = pat.search(lower_text)
+        if m:
+            return False, f"Blacklisted spam pattern: {m.group(0)}"
+
+    return True, ""
 
 # Headers to purge from markdown (title, heading level (0 = any level 1-6), instance)
 HEADERS_TO_PURGE: list[tuple[str, int, str]] = [
@@ -194,6 +266,10 @@ def clean_document_record(item: tuple[int, str, str]) -> tuple[int, str]:
     """Helper worker for thread pool: (doc_id, url, html) -> (doc_id, cleaned_markdown)."""
     doc_id, url, html_content = item
     try:
+        is_valid, reason = validate_content(html_content, url=url)
+        if not is_valid:
+            logger.warning(f"Rejected spam document {doc_id} ({url}): {reason}")
+            return doc_id, ""
         md = clean_html(html_content, base_url=url)
         return doc_id, md
     except Exception as e:
@@ -233,11 +309,11 @@ def clean_database(
     cursor = conn.cursor()
 
     if only_missing:
-        query_count = "SELECT count(*) FROM storedcrawlresult WHERE length(html) > 0 AND (markdown IS NULL OR length(markdown) = 0)"
-        query_fetch = "SELECT id, url, html FROM storedcrawlresult WHERE length(html) > 0 AND (markdown IS NULL OR length(markdown) = 0)"
+        query_count = "SELECT count(*) FROM documents WHERE length(html) > 0 AND (markdown IS NULL OR length(markdown) = 0)"
+        query_fetch = "SELECT id, url, html FROM documents WHERE length(html) > 0 AND (markdown IS NULL OR length(markdown) = 0)"
     else:
-        query_count = "SELECT count(*) FROM storedcrawlresult WHERE length(html) > 0"
-        query_fetch = "SELECT id, url, html FROM storedcrawlresult WHERE length(html) > 0"
+        query_count = "SELECT count(*) FROM documents WHERE length(html) > 0"
+        query_fetch = "SELECT id, url, html FROM documents WHERE length(html) > 0"
 
     cursor.execute(query_count)
     total_docs = cursor.fetchone()[0]
@@ -270,7 +346,7 @@ def clean_database(
             # Batch update into sqlite
             update_data = [(md, doc_id) for doc_id, md in results]
             conn.executemany(
-                "UPDATE storedcrawlresult SET markdown = ? WHERE id = ?",
+                "UPDATE documents SET markdown = ? WHERE id = ?",
                 update_data,
             )
             conn.commit()
@@ -310,7 +386,7 @@ def strip_header_nav_from_database(
     conn.execute("PRAGMA journal_mode=WAL")
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id, markdown FROM storedcrawlresult WHERE markdown LIKE '%* [FTU]%'")
+    cursor.execute("SELECT id, markdown FROM documents WHERE markdown LIKE '%* [FTU]%'")
     rows = cursor.fetchall()
     if verbose:
         print(f"Found {len(rows)} rows with header navigation to clean in {db_path}...")
@@ -323,7 +399,7 @@ def strip_header_nav_from_database(
 
     for i in range(0, len(updates), batch_size):
         chunk = updates[i : i + batch_size]
-        conn.executemany("UPDATE storedcrawlresult SET markdown = ? WHERE id = ?", chunk)
+        conn.executemany("UPDATE documents SET markdown = ? WHERE id = ?", chunk)
         conn.commit()
 
     conn.close()

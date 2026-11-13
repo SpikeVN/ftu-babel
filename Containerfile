@@ -31,6 +31,7 @@ RUN pip install --no-cache-dir \
     "httpx>=0.27.0" \
     "sqlalchemy>=2.0.0" \
     "sqlite-vec>=0.1.9" \
+    "usearch>=2.26.0" \
     "tqdm>=4.66.0" \
     "uvicorn>=0.30.0"
 

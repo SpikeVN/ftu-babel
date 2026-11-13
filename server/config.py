@@ -40,12 +40,35 @@ elif Path("/app/data/stash.db").exists():
 else:
     DEFAULT_DB_PATH = str(PROJECT_ROOT / "stash.db")
 
-# FTULabs Gateway / Upstream API
-FTULABS_API_ENDPOINT = os.environ.get("FTULABS_API_ENDPOINT", "").rstrip("/")
-FTULABS_API_KEY = os.environ.get("FTULABS_API_KEY", "")
+_env_usearch_path = os.environ.get("USEARCH_INDEX_PATH")
+if _env_usearch_path:
+    DEFAULT_USEARCH_PATH = _env_usearch_path
+elif Path("/app/data/stash.usearch").exists():
+    DEFAULT_USEARCH_PATH = "/app/data/stash.usearch"
+else:
+    DEFAULT_USEARCH_PATH = str(PROJECT_ROOT / "stash.usearch")
+
+# MOSS Gateway / Upstream API
+MOSS_API_KEY = os.environ.get("MOSS_API_KEY") or os.environ.get("FTULABS_API_KEY", "")
+MOSS_EMBEDDING_ENDPOINT = (
+    os.environ.get("MOSS_EMBEDDING_ENDPOINT")
+    or os.environ.get("FTULABS_API_ENDPOINT", "")
+).rstrip("/")
+MOSS_RERANKING_ENDPOINT = (
+    os.environ.get("MOSS_RERANKING_ENDPOINT")
+    or os.environ.get("FTULABS_API_ENDPOINT", "")
+).rstrip("/")
+
+# Backwards-compatibility aliases
+FTULABS_API_KEY = MOSS_API_KEY
+FTULABS_API_ENDPOINT = MOSS_EMBEDDING_ENDPOINT
 
 # SearXNG Web Search
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8080").rstrip("/")
+
+
+def _is_local_endpoint(url: str) -> bool:
+    return any(host in url for host in ("127.0.0.1", "localhost", "host.docker.internal"))
 
 
 def _join_endpoint(base: str, path: str) -> str:
@@ -60,12 +83,18 @@ def _join_endpoint(base: str, path: str) -> str:
 
 # Embedding Settings
 DEFAULT_EMBED_URL = os.environ.get("EMBED_URL") or (
-    _join_endpoint(FTULABS_API_ENDPOINT, "embeddings")
-    if FTULABS_API_ENDPOINT
+    _join_endpoint(MOSS_EMBEDDING_ENDPOINT, "embeddings")
+    if MOSS_EMBEDDING_ENDPOINT
     else "http://127.0.0.1:8888/v1/embeddings"
 )
 DEFAULT_EMBED_MODEL = os.environ.get("EMBED_MODEL", "unsloth/embeddinggemma-2-GGUF")
-DEFAULT_EMBED_API_KEY = os.environ.get("EMBED_API_KEY") or FTULABS_API_KEY
+_env_embed_key = os.environ.get("EMBED_API_KEY")
+if _env_embed_key is not None:
+    DEFAULT_EMBED_API_KEY = _env_embed_key
+elif _is_local_endpoint(DEFAULT_EMBED_URL):
+    DEFAULT_EMBED_API_KEY = ""
+else:
+    DEFAULT_EMBED_API_KEY = MOSS_API_KEY
 DEFAULT_EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "64"))
 DEFAULT_CHUNK_BATCH_SIZE = int(os.environ.get("EMBED_CHUNK_BATCH_SIZE", "16"))
 DEFAULT_CONCURRENCY = int(os.environ.get("EMBED_CONCURRENCY", "4"))
@@ -79,23 +108,29 @@ CHUNK_FANOUT = int(os.environ.get("EMBED_CHUNK_FANOUT", "5"))
 QUERY_PREFIX = os.environ.get("EMBED_QUERY_PREFIX", "task: search result | query: ")
 DOC_PREFIX = os.environ.get("EMBED_DOC_PREFIX", "title: none | text: ")
 
-# ZeroEntropy Reranker Settings
-ZEROENTROPY_API_KEY = os.environ.get("ZEROENTROPY_API_KEY") or FTULABS_API_KEY
+# ZeroEntropy / MOSS Reranker Settings
+ZEROENTROPY_API_KEY = os.environ.get("ZEROENTROPY_API_KEY") or MOSS_API_KEY
 ZEROENTROPY_BASE_URL = (
     os.environ.get("ZEROENTROPY_BASE_URL")
-    or FTULABS_API_ENDPOINT
+    or (
+        MOSS_RERANKING_ENDPOINT
+        if (MOSS_RERANKING_ENDPOINT.endswith("/v1") or not MOSS_RERANKING_ENDPOINT)
+        else f"{MOSS_RERANKING_ENDPOINT}/v1"
+    )
     or "https://api.zeroentropy.dev/v1"
 ).rstrip("/")
 ZERANK_MODEL = os.environ.get("ZERANK_MODEL", "zerank-2")
 ZERANK_CANDIDATE_K = int(os.environ.get("ZERANK_CANDIDATE_K", "30"))
-ZERANK_TIMEOUT = float(os.environ.get("ZERANK_TIMEOUT", "30"))
+ZERANK_TIMEOUT = float(os.environ.get("ZERANK_TIMEOUT", "45"))
+RERANK_ENABLED = bool(ZEROENTROPY_API_KEY or _is_local_endpoint(ZEROENTROPY_BASE_URL))
 
 # LLM Summarization Settings
+_llm_base = MOSS_EMBEDDING_ENDPOINT or MOSS_RERANKING_ENDPOINT
 DEFAULT_LLM_URL = os.environ.get("LLM_URL") or (
-    _join_endpoint(FTULABS_API_ENDPOINT, "chat/completions")
-    if FTULABS_API_ENDPOINT
+    _join_endpoint(_llm_base, "chat/completions")
+    if _llm_base
     else "http://127.0.0.1:8888/v1/chat/completions"
 )
 DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "unsloth/gemma-4-E2B-it-qat-GGUF")
-DEFAULT_LLM_API_KEY = os.environ.get("LLM_API_KEY") or FTULABS_API_KEY
+DEFAULT_LLM_API_KEY = os.environ.get("LLM_API_KEY") or MOSS_API_KEY
 MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "3000"))

@@ -38,3 +38,12 @@ bench/*.json
 *.sqlite-shm
 *.sqlite3-shm
 *.db-shm
+
+# Vector Index files
+*.usearch
+stash.usearch
+
+# Downloaded documents & PDFs
+downloads/
+data/
+

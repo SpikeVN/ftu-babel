@@ -27,7 +27,7 @@ def health_endpoint():
         stash = get_stash()
         with stash.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT count(*) FROM storedcrawlresult")
+            cursor.execute("SELECT count(*) FROM documents")
             count = cursor.fetchone()[0]
             db_ok = True
     except Exception as e:

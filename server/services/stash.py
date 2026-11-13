@@ -50,6 +50,10 @@ from server.config import (
     DEFAULT_DB_PATH,
     DEFAULT_EMBED_URL,
     FTULABS_API_KEY,
+    MOSS_API_KEY,
+    MOSS_EMBEDDING_ENDPOINT,
+    MOSS_RERANKING_ENDPOINT,
+    RERANK_ENABLED,
     ZERANK_CANDIDATE_K,
     ZEROENTROPY_API_KEY,
 )
@@ -242,9 +246,10 @@ class Stash:
             snippet(f.fts_documents, 3, '', '', '...', 35) AS snippet,
             COALESCE(ds.summary, '') AS summary,
             COALESCE(ds.published_date, substr(s.saved_at, 1, 10)) AS doc_date,
-            s.saved_at
+            s.saved_at,
+            substr(COALESCE(s.markdown, ''), 1, 4000) AS rerank_text
         FROM fts_documents f
-        LEFT JOIN storedcrawlresult s ON s.id = f.doc_id
+        LEFT JOIN documents s ON s.id = f.doc_id
         LEFT JOIN document_summaries ds ON ds.doc_id = f.doc_id
         WHERE f.fts_documents MATCH ?
         ORDER BY bm25_rank ASC
@@ -274,7 +279,7 @@ class Stash:
 
         hits = []
         for r in rows:
-            doc_id, url, title, bm25_rank, snippet, summary, doc_date, saved_at = r
+            doc_id, url, title, bm25_rank, snippet, summary, doc_date, saved_at, rerank_text = r
             score = max(0.0, -float(bm25_rank))
             hits.append({
                 "doc_id": doc_id,
@@ -284,6 +289,7 @@ class Stash:
                 "summary": summary.strip() if summary else "",
                 "published_date": str(doc_date) if doc_date else "",
                 "saved_at": str(saved_at) if saved_at else "",
+                "rerank_text": rerank_text.strip() if rerank_text else "",
             })
         return hits
 
@@ -300,7 +306,7 @@ class Stash:
         combining candidate rankings with Reciprocal Rank Fusion (RRF),
         and reranking candidates using zerank-2.
         """
-        has_rerank_key = bool(ZEROENTROPY_API_KEY or FTULABS_API_KEY)
+        has_rerank_key = RERANK_ENABLED
         candidate_k = max(top_k * 2, ZERANK_CANDIDATE_K) if has_rerank_key else max(top_k * 2, 20)
 
         vec_hits: list[dict[str, Any]] = []
@@ -359,6 +365,8 @@ class Stash:
                         candidate_docs[doc_id]["summary"] = hit["summary"]
                     if not candidate_docs[doc_id].get("published_date") and hit.get("published_date"):
                         candidate_docs[doc_id]["published_date"] = hit["published_date"]
+                    if not candidate_docs[doc_id].get("rerank_text") and hit.get("rerank_text"):
+                        candidate_docs[doc_id]["rerank_text"] = hit["rerank_text"]
 
             fused = sorted(candidate_docs.keys(), key=lambda did: rrf_scores[did], reverse=True)
             max_rrf = max(rrf_scores.values()) if rrf_scores else 1.0
@@ -541,7 +549,7 @@ class Stash:
             COALESCE(ds.summary, '') AS summary,
             COALESCE(ds.published_date, substr(s.saved_at, 1, 10)) AS published_date,
             COALESCE(s.markdown, s.html, '') AS content
-        FROM storedcrawlresult s
+        FROM documents s
         LEFT JOIN document_summaries ds ON ds.doc_id = s.id
         WHERE s.id = ?
         LIMIT 1
@@ -584,7 +592,7 @@ class Stash:
             COALESCE(ds.summary, '') AS summary,
             COALESCE(ds.published_date, substr(s.saved_at, 1, 10)) AS published_date,
             COALESCE(s.markdown, s.html, '') AS content
-        FROM storedcrawlresult s
+        FROM documents s
         LEFT JOIN document_summaries ds ON ds.doc_id = s.id
         WHERE s.id IN ({placeholders})
         """

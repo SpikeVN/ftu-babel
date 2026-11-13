@@ -15,19 +15,24 @@ from processing.embeddings import (
     MAX_RETRIES,
     QUERY_PREFIX,
     VECTOR_DIM,
+    build_contextual_prefix,
     init_chunk_tables,
     init_sqlite_vec_tables,
     main,
     prepare_embedding_text,
     run_chunk_embedding,
     run_embedding_for_all_documents,
+    run_hierarchical_chunk_embedding,
     split_into_chunks,
+    split_into_hierarchical_chunks,
 )
 from server.config import (
     DEFAULT_DB_PATH,
     DEFAULT_EMBED_API_KEY as DEFAULT_API_KEY,
     DEFAULT_EMBED_URL,
     FTULABS_API_ENDPOINT,
+    MOSS_API_KEY,
+    MOSS_EMBEDDING_ENDPOINT,
     load_env_file,
 )
 from server.services.embedding import (
@@ -39,6 +44,8 @@ from server.services.embedding import (
 
 __all__ = [
     "load_env_file",
+    "MOSS_API_KEY",
+    "MOSS_EMBEDDING_ENDPOINT",
     "FTULABS_API_ENDPOINT",
     "DEFAULT_EMBED_URL",
     "DEFAULT_MODEL",
@@ -57,11 +64,14 @@ __all__ = [
     "DOC_PREFIX",
     "prepare_embedding_text",
     "split_into_chunks",
+    "split_into_hierarchical_chunks",
+    "build_contextual_prefix",
     "EmbeddingClient",
     "init_sqlite_vec_tables",
     "init_chunk_tables",
     "run_embedding_for_all_documents",
     "run_chunk_embedding",
+    "run_hierarchical_chunk_embedding",
     "get_shared_embed_client",
     "score_vector",
     "search_similar",
