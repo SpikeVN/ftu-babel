@@ -119,7 +119,9 @@ def clean_passage_snippet(text: str, max_chars: int = 900) -> str:
             continue
         kept.append(s)
     joined = "\n".join(kept).strip() or cleaned
-    return joined[:max_chars].strip()
+    if len(joined) > max_chars:
+        return joined[:max_chars].rstrip() + "..."
+    return joined
 
 
 def format_search_results_as_text(results: Sequence[Any]) -> str:
@@ -152,7 +154,10 @@ def format_search_results_as_text(results: Sequence[Any]) -> str:
         if summary:
             lines.append(f"Summary (auto-generated): {summary}")
         if content:
-            lines.append(f"Content:\n{content}")
+            brief = content.rstrip()
+            if not brief.endswith("..."):
+                brief += "..."
+            lines.append(f"Brief Content (truncated):\n{brief}")
         blocks.append("\n".join(lines))
 
     return "\n\n---\n\n".join(blocks)

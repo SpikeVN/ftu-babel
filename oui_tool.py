@@ -113,7 +113,10 @@ class Tools:
             if summary:
                 lines.append(f"Summary (auto-generated): {summary}")
             if content:
-                lines.append(f"Content:\n{content}")
+                brief = content.rstrip()
+                if not brief.endswith("..."):
+                    brief += "..."
+                lines.append(f"Brief Content (truncated):\n{brief}")
             blocks.append("\n".join(lines))
         return "\n\n---\n\n".join(blocks)
 
