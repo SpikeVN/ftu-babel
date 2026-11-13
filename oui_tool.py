@@ -27,6 +27,7 @@ DEFAULT_API_URL = os.environ.get(
     "SEARCH_API_URL", "https://babel.falcolabs.org"
 )
 DEFAULT_API_KEY = os.environ.get("SEARCH_API_KEY", "")
+MAX_FETCH_TOTAL_CHARS = 24000
 
 
 class Tools:
@@ -312,6 +313,22 @@ class Tools:
             status_code, body = self._http_post(endpoint, payload, timeout=60.0)
             if status_code >= 400:
                 return f"Error {status_code} fetching documents from Babel: {body}"
+            if len(body) > MAX_FETCH_TOTAL_CHARS:
+                if payload["format"] == "json":
+                    try:
+                        docs = json.loads(body)
+                        if isinstance(docs, list) and docs:
+                            per_doc = max(2000, (MAX_FETCH_TOTAL_CHARS - 1000) // len(docs))
+                            for d in docs:
+                                c = d.get("content") or ""
+                                if len(c) > per_doc:
+                                    d["content"] = c[:per_doc].rstrip() + f"\n\n[... truncated at {per_doc} of {len(c)} chars ...]"
+                            body = json.dumps(docs, ensure_ascii=False)
+                    except Exception:
+                        pass
+                if len(body) > MAX_FETCH_TOTAL_CHARS:
+                    orig_len = len(body)
+                    body = body[:MAX_FETCH_TOTAL_CHARS].rstrip() + f"\n\n[... truncated at {MAX_FETCH_TOTAL_CHARS} of {orig_len} chars ...]"
             return body
         except Exception as exc:
             return f"Error fetching documents from Babel: {exc}"
