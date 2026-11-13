@@ -328,7 +328,7 @@ class Stash:
         combining candidate rankings with Reciprocal Rank Fusion (RRF),
         and reranking candidates using zerank-2.
         """
-        has_rerank_key = RERANK_ENABLED
+        has_rerank_key = RERANK_ENABLED and float(hybrid_blend) > 0.0
         candidate_k = max(top_k * 2, ZERANK_CANDIDATE_K) if has_rerank_key else max(top_k * 2, 20)
         raw_candidate_k = max(candidate_k * 2, 50)
 

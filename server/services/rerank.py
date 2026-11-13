@@ -160,7 +160,7 @@ def rerank_hits(
 
     candidates = hits[:min(len(hits), max(top_k, 12))]
     documents = [
-        build_rerank_document(hit, max_chars=2500)
+        build_rerank_document(hit, max_chars=900)
         for hit in candidates
     ]
 
