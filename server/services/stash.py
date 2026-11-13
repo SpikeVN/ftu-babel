@@ -71,12 +71,14 @@ _ARTICLE_ID_RE = re.compile(r"/(\d+)-[^/]+$")
 
 
 def _canonical_doc_key(url: str) -> str:
-    """Normalize URL (decoding percent-encodings and collapsing FTU article ID slugs) for deduplication."""
+    """Normalize URL (decoding percent-encodings, stripping userinfo, collapsing FTU article IDs) for deduplication."""
     if not url:
         return ""
     decoded = urllib.parse.unquote(url).strip()
     parsed = urllib.parse.urlsplit(decoded)
-    host = parsed.netloc.lower()
+    host = (parsed.hostname or parsed.netloc).lower()
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
     path = re.sub(r"/+", "/", parsed.path).rstrip("/")
     m = _ARTICLE_ID_RE.search(path)
     if m:
@@ -393,13 +395,19 @@ class Stash:
             max_rrf = max(rrf_scores.values()) if rrf_scores else 1.0
             hits: list[dict[str, Any]] = []
             seen_canon_keys: set[str] = set()
+            seen_snippets: set[str] = set()
             for did in fused:
                 doc_item = candidate_docs[did]
                 canon_key = _canonical_doc_key(doc_item.get("url", ""))
                 if canon_key and canon_key in seen_canon_keys:
                     continue
+                snip_key = (doc_item.get("snippet") or "").strip()[:200].lower()
+                if snip_key and snip_key in seen_snippets:
+                    continue
                 if canon_key:
                     seen_canon_keys.add(canon_key)
+                if snip_key:
+                    seen_snippets.add(snip_key)
                 doc_item["score"] = round(rrf_scores[did] / max_rrf, 4) if max_rrf > 0 else 0.5
                 hits.append(doc_item)
                 if len(hits) >= candidate_k:
