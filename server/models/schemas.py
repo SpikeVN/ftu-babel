@@ -45,6 +45,8 @@ class SingleSearchResult(BaseModel):
     summary: str | None = None
     score: float
     date: Optional[dt_date] = None
+    chunk_index: Optional[int] = None
+    total_chunks: Optional[int] = None
 
     @field_validator("content", mode="before")
     @classmethod
@@ -60,6 +62,12 @@ class DocumentDetailResponse(BaseModel):
     date: str | None = None
     summary: str | None = None
     content: str
+    chunk_index: Optional[int] = None
+    chunk_start: Optional[int] = None
+    chunk_end: Optional[int] = None
+    total_chunks: Optional[int] = None
+    truncated: bool = False
+    total_chars: Optional[int] = None
 
 
 class DocumentBatchRequest(BaseModel):
@@ -68,6 +76,9 @@ class DocumentBatchRequest(BaseModel):
     ids: Optional[list[int]] = None
     clean: bool = True
     format: Optional[Literal["json", "text"]] = None
+    chunk_index: Optional[int] = None
+    window: int = 1
+    max_chars: Optional[int] = None
 
     def resolved_ids(self) -> list[int]:
         """Resolve doc_ids from either 'doc_ids' or 'ids' field."""

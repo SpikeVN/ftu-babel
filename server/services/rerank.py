@@ -14,6 +14,8 @@ from server.config import (
     MOSS_API_KEY,
     MOSS_RERANKING_ENDPOINT,
     ZERANK_CANDIDATE_K,
+    ZERANK_MAX_CANDIDATES,
+    ZERANK_MAX_CHARS,
     ZERANK_MODEL,
     ZERANK_TIMEOUT,
     ZEROENTROPY_API_KEY,
@@ -37,20 +39,23 @@ def get_shared_rerank_client() -> httpx.Client:
     return _shared_rerank_client
 
 
-def build_rerank_document(hit: dict[str, Any], max_chars: int = 3500) -> str:
+def build_rerank_document(
+    hit: dict[str, Any],
+    max_chars: int = ZERANK_MAX_CHARS,
+    include_summary: bool = False,
+) -> str:
     """
-    Construct a high-signal candidate document combining title, summary, and rerank_text/snippet.
-    Prioritizes detailed chunk/passage content (rerank_text) over high-level 1-sentence summaries,
-    while still including title and summary for macro context.
+    Construct a high-signal candidate document combining compact title and centered passage content.
+    Omits generic 1-sentence summaries by default when rerank_text is present so passage evidence fits comfortably.
     """
-    title = (hit.get("title") or "").strip()
+    title = (hit.get("title") or "").strip()[:160]
     summary = (hit.get("summary") or "").strip()
     rerank_text = (hit.get("rerank_text") or hit.get("snippet") or "").strip()
 
     parts: list[str] = []
     if title:
         parts.append(f"Tiêu đề: {title}")
-    if summary and summary != rerank_text:
+    if summary and summary != rerank_text and (include_summary or not rerank_text):
         parts.append(f"Tóm tắt: {summary}")
     if rerank_text:
         parts.append(f"Nội dung: {rerank_text}")
@@ -159,9 +164,9 @@ def rerank_hits(
             "Set MOSS_API_KEY or ZEROENTROPY_API_KEY to rerank search results."
         )
 
-    candidates = hits[:min(len(hits), max(top_k, 12))]
+    candidates = hits[:min(len(hits), max(top_k, ZERANK_MAX_CANDIDATES))]
     documents = [
-        build_rerank_document(hit, max_chars=900)
+        build_rerank_document(hit, max_chars=ZERANK_MAX_CHARS)
         for hit in candidates
     ]
 

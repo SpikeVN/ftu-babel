@@ -25,7 +25,13 @@ from server.config import (
     MAX_RETRIES,
     QUERY_PREFIX,
 )
-from server.models.text import clean_normal_text, clean_passage_snippet, extract_title_from_text
+from server.models.text import (
+    clean_normal_text,
+    clean_passage_snippet,
+    extract_centered_passage,
+    extract_title_from_text,
+    resolve_document_title,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +195,82 @@ def get_shared_embed_client(
     return client
 
 
+def _aggregate_chunk_rows(
+    conn: sqlite3.Connection,
+    rows: Sequence[tuple[Any, ...]],
+    top_k: int,
+    include_rerank_text: bool,
+) -> list[dict[str, Any]]:
+    """Aggregate chunk-level kNN rows per document with child-centered snippets and chunk coordinates."""
+    best: dict[int, dict[str, Any]] = {}
+    context: dict[int, dict[tuple[int | None, str], float]] = {}
+
+    for (
+        distance_raw,
+        doc_id,
+        chunk_text,
+        parent_chunk_index,
+        url,
+        title,
+        summary,
+        doc_date,
+        saved_at,
+        parent_text,
+    ) in rows:
+        distance = float(distance_raw)
+        parent_idx = int(parent_chunk_index) if parent_chunk_index is not None else None
+        effective_parent = (parent_text or chunk_text or "").strip()
+        child_anchor = (chunk_text or "").strip()
+
+        if include_rerank_text:
+            centered_rerank = extract_centered_passage(effective_parent, child_anchor, max_chars=1100)
+            if centered_rerank:
+                curr_passages = context.setdefault(doc_id, {})
+                key = (parent_idx, centered_rerank)
+                if key not in curr_passages or distance < curr_passages[key]:
+                    curr_passages[key] = distance
+
+        if doc_id in best and best[doc_id]["distance"] <= distance:
+            continue
+
+        centered_snippet = extract_centered_passage(effective_parent, child_anchor, max_chars=1200)
+        resolved_title = resolve_document_title(title or "", effective_parent or child_anchor, url or "")
+        best[doc_id] = {
+            "doc_id": doc_id,
+            "distance": distance,
+            "score": 1.0 - distance,
+            "url": url,
+            "title": resolved_title,
+            "snippet": centered_snippet,
+            "summary": summary or "",
+            "published_date": str(doc_date) if doc_date else "",
+            "saved_at": str(saved_at) if saved_at else "",
+            "chunk_index": parent_idx,
+        }
+
+    results = sorted(best.values(), key=lambda r: r["distance"])[:top_k]
+    if results:
+        doc_ids = [r["doc_id"] for r in results]
+        placeholders = ",".join("?" for _ in doc_ids)
+        count_rows = conn.execute(
+            f"SELECT doc_id, COUNT(*) FROM document_chunks "
+            f"WHERE chunk_type = 'parent' AND doc_id IN ({placeholders}) GROUP BY doc_id",
+            doc_ids,
+        ).fetchall()
+        parent_counts = {int(did): int(cnt) for did, cnt in count_rows}
+        for result in results:
+            cnt = parent_counts.get(result["doc_id"], 0)
+            result["total_chunks"] = cnt if cnt > 0 else None
+
+    if include_rerank_text:
+        for result in results:
+            doc_passages = context.get(result["doc_id"], {})
+            sorted_passages = sorted(doc_passages.items(), key=lambda item: item[1])
+            passages = [p for (_, p), _ in sorted_passages[:2]]
+            result["rerank_text"] = "\n\n".join(passages)[:2400]
+    return results
+
+
 def _score_chunks(
     conn: sqlite3.Connection,
     serialized_vec: bytes,
@@ -199,11 +281,10 @@ def _score_chunks(
     chunk_k = max(top_k * CHUNK_FANOUT, top_k)
     query = """
     SELECT
-        v.chunk_id,
         v.distance,
         c.doc_id,
         c.chunk_text,
-        c.chunk_index,
+        p.chunk_index AS parent_chunk_index,
         s.url,
         COALESCE(json_extract(s.metadata, '$.title'), '') AS title,
         COALESCE(ds.summary, '') AS summary,
@@ -219,42 +300,7 @@ def _score_chunks(
     ORDER BY v.distance ASC
     """
     rows = conn.execute(query, (serialized_vec, chunk_k)).fetchall()
-
-    best: dict[int, dict[str, Any]] = {}
-    context: dict[int, dict[str, float]] = {}  # doc_id -> {passage_text: best_distance}
-    for _chunk_id, distance, doc_id, chunk_text, _chunk_index, url, title, summary, doc_date, saved_at, parent_text in rows:
-        distance = float(distance)
-        effective_passage = (parent_text or chunk_text or "").strip()
-        if effective_passage:
-            curr_passages = context.setdefault(doc_id, {})
-            if effective_passage not in curr_passages or distance < curr_passages[effective_passage]:
-                curr_passages[effective_passage] = distance
-
-        if doc_id in best and best[doc_id]["distance"] <= distance:
-            continue
-        text = effective_passage or ""
-        clean_snip = clean_passage_snippet(text, max_chars=900)
-        resolved_title = (title or "").strip() or extract_title_from_text(text, url)
-        best[doc_id] = {
-            "doc_id": doc_id,
-            "distance": distance,
-            "score": 1.0 - distance,
-            "url": url,
-            "title": resolved_title,
-            "snippet": clean_snip,
-            "summary": summary or "",
-            "published_date": str(doc_date) if doc_date else "",
-            "saved_at": str(saved_at) if saved_at else "",
-        }
-
-    results = sorted(best.values(), key=lambda r: r["distance"])[:top_k]
-    if include_rerank_text:
-        for result in results:
-            doc_passages = context.get(result["doc_id"], {})
-            sorted_passages = sorted(doc_passages.items(), key=lambda item: item[1])
-            passages = [p for p, _ in sorted_passages[:3]]
-            result["rerank_text"] = "\n\n".join(passages)[:8000]
-    return results
+    return _aggregate_chunk_rows(conn, rows, top_k, include_rerank_text)
 
 
 def _score_chunks_usearch(
@@ -281,7 +327,7 @@ def _score_chunks_usearch(
         c.chunk_id,
         c.doc_id,
         c.chunk_text,
-        c.chunk_index,
+        p.chunk_index AS parent_chunk_index,
         s.url,
         COALESCE(json_extract(s.metadata, '$.title'), '') AS title,
         COALESCE(ds.summary, '') AS summary,
@@ -295,43 +341,22 @@ def _score_chunks_usearch(
     WHERE c.chunk_id IN ({placeholders})
     """
     rows = conn.execute(query, chunk_ids).fetchall()
-
-    best: dict[int, dict[str, Any]] = {}
-    context: dict[int, dict[str, float]] = {}
-
-    for chunk_id, doc_id, chunk_text, _chunk_index, url, title, summary, doc_date, saved_at, parent_text in rows:
-        distance = distances.get(chunk_id, 1.0)
-        effective_passage = (parent_text or chunk_text or "").strip()
-        if effective_passage:
-            curr_passages = context.setdefault(doc_id, {})
-            if effective_passage not in curr_passages or distance < curr_passages[effective_passage]:
-                curr_passages[effective_passage] = distance
-
-        if doc_id in best and best[doc_id]["distance"] <= distance:
-            continue
-        text = effective_passage or ""
-        clean_snip = clean_passage_snippet(text, max_chars=900)
-        resolved_title = (title or "").strip() or extract_title_from_text(text, url)
-        best[doc_id] = {
-            "doc_id": doc_id,
-            "distance": distance,
-            "score": 1.0 - distance,
-            "url": url,
-            "title": resolved_title,
-            "snippet": clean_snip,
-            "summary": summary or "",
-            "published_date": str(doc_date) if doc_date else "",
-            "saved_at": str(saved_at) if saved_at else "",
-        }
-
-    results = sorted(best.values(), key=lambda r: r["distance"])[:top_k]
-    if include_rerank_text:
-        for result in results:
-            doc_passages = context.get(result["doc_id"], {})
-            sorted_passages = sorted(doc_passages.items(), key=lambda item: item[1])
-            passages = [p for p, _ in sorted_passages[:3]]
-            result["rerank_text"] = "\n\n".join(passages)[:8000]
-    return results
+    normalized_rows = [
+        (
+            distances.get(chunk_id, 1.0),
+            doc_id,
+            chunk_text,
+            parent_chunk_index,
+            url,
+            title,
+            summary,
+            doc_date,
+            saved_at,
+            parent_text,
+        )
+        for chunk_id, doc_id, chunk_text, parent_chunk_index, url, title, summary, doc_date, saved_at, parent_text in rows
+    ]
+    return _aggregate_chunk_rows(conn, normalized_rows, top_k, include_rerank_text)
 
 
 def _score_documents(

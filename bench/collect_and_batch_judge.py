@@ -42,6 +42,7 @@ from bench.run_benchmark import (  # noqa: E402
     format_question_for_judge,
     post_json_with_retry,
     run_genie_agent_turn,
+    sanitize_model_response,
 )
 from oui_tool import Tools as BabelToolHandler  # noqa: E402
 
@@ -124,7 +125,7 @@ async def call_ftu_assistant(
             choice = data["choices"][0]
             msg = choice.get("message", {})
             usage = data.get("usage") or {}
-            content = (msg.get("content") or "").strip()
+            content = sanitize_model_response(msg.get("content") or "")
             prompt_toks = usage.get("prompt_tokens", 0)
             completion_toks = usage.get("completion_tokens", 0)
             _log(f"A ({latency:.1f}s, {prompt_toks}->{completion_toks} tok): {compact_preview(content, 240)}")

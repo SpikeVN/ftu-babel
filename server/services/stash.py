@@ -51,6 +51,9 @@ from sqlalchemy.sql.elements import ColumnElement
 from server.config import (
     DEFAULT_DB_PATH,
     DEFAULT_EMBED_URL,
+    FETCH_BATCH_MAX_CHARS,
+    FETCH_DEFAULT_MAX_CHARS,
+    FETCH_SHORT_DOC_CHARS,
     FTULABS_API_KEY,
     MOSS_API_KEY,
     MOSS_EMBEDDING_ENDPOINT,
@@ -61,7 +64,13 @@ from server.config import (
 )
 from server.db import SQLiteConnectionPool
 from server.models import Document, SingleSearchResult, StoredCrawlResult, clean_normal_text
-from server.models.text import extract_title_from_text
+from server.models.text import (
+    _truncate_cleanly,
+    clean_passage_lines,
+    extract_centered_passage,
+    extract_title_from_text,
+    resolve_document_title,
+)
 from server.services.embedding import score_vector as _score_vector, search_similar as _search_similar
 from server.services.rerank import rerank_hits
 
@@ -246,13 +255,59 @@ class Stash:
         from processing.cleanup import clean_html as _clean_html
         return _clean_html(html, base_url=base_url)
 
+    @staticmethod
+    def _resolve_keyword_parent_chunk(
+        cursor: sqlite3.Cursor,
+        doc_id: int,
+        clean_snip: str,
+        tokens: list[str],
+    ) -> tuple[int | None, str | None]:
+        """Locate the best matching parent chunk (chunk_index, chunk_text) for a keyword hit."""
+        anchors: list[str] = []
+        if clean_snip:
+            segments: list[str] = []
+            for part in clean_snip.replace("\n", "...").split("..."):
+                seg = " ".join(part.split()).strip()
+                if len(seg) >= 16:
+                    segments.append(seg)
+            segments.sort(key=len, reverse=True)
+            for seg in segments[:2]:
+                phrase = seg[:45]
+                if len(seg) > 45:
+                    sp = phrase.rfind(" ")
+                    if sp >= 18:
+                        phrase = phrase[:sp]
+                phrase = phrase.strip()
+                if phrase:
+                    anchors.append(phrase)
+
+        for tok in sorted((t.strip() for t in tokens if len(t.strip()) >= 2), key=len, reverse=True)[:2]:
+            if tok not in anchors:
+                anchors.append(tok)
+
+        for anchor in anchors[:3]:
+            row = cursor.execute(
+                """
+                SELECT chunk_index, chunk_text
+                FROM document_chunks
+                WHERE doc_id = ? AND chunk_type = 'parent'
+                  AND (instr(lower(chunk_text), ?) > 0 OR instr(chunk_text, ?) > 0)
+                ORDER BY chunk_index ASC
+                LIMIT 1
+                """,
+                (doc_id, anchor.lower(), anchor),
+            ).fetchone()
+            if row is not None:
+                return int(row[0]), str(row[1])
+        return None, None
+
     def search_keyword(
         self,
         query_text: str,
         top_k: int = 20,
         conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
-        """Perform keyword BM25 search over fts_documents in SQLite."""
+        """Perform keyword BM25 search over fts_documents in SQLite with matched-chunk resolution."""
         clean = "".join(c if c.isalnum() or c.isspace() else " " for c in query_text).strip()
         tokens = clean.split()
         if not tokens:
@@ -265,11 +320,10 @@ class Stash:
             f.url,
             f.title,
             bm25(f.fts_documents, 5.0, 2.0, 1.0, 3.0) AS bm25_rank,
-            snippet(f.fts_documents, 3, '', '', '...', 35) AS snippet,
+            snippet(f.fts_documents, 3, '', '', '...', 64) AS snippet,
             COALESCE(ds.summary, '') AS summary,
             COALESCE(ds.published_date, substr(s.saved_at, 1, 10)) AS doc_date,
-            s.saved_at,
-            substr(COALESCE(s.markdown, ''), 1, 4000) AS rerank_text
+            s.saved_at
         FROM fts_documents f
         LEFT JOIN documents s ON s.id = f.doc_id
         LEFT JOIN document_summaries ds ON ds.doc_id = f.doc_id
@@ -278,7 +332,7 @@ class Stash:
         LIMIT ?
         """
 
-        def _exec_search(c: sqlite3.Connection) -> list[Any]:
+        def _exec_search(c: sqlite3.Connection) -> tuple[list[Any], dict[int, int], dict[int, tuple[int | None, str | None]]]:
             cursor = c.cursor()
             rows = cursor.execute(sql, (q_and, top_k)).fetchall()
             if len(rows) < top_k and len(tokens) > 1:
@@ -291,27 +345,71 @@ class Stash:
                         existing_ids.add(r[0])
                         if len(rows) >= top_k:
                             break
-            return rows
+
+            doc_ids = [int(r[0]) for r in rows]
+            parent_counts: dict[int, int] = {}
+            resolved_chunks: dict[int, tuple[int | None, str | None]] = {}
+            if doc_ids:
+                placeholders = ",".join("?" for _ in doc_ids)
+                for did, cnt in cursor.execute(
+                    f"SELECT doc_id, COUNT(*) FROM document_chunks "
+                    f"WHERE chunk_type = 'parent' AND doc_id IN ({placeholders}) GROUP BY doc_id",
+                    doc_ids,
+                ).fetchall():
+                    parent_counts[int(did)] = int(cnt)
+
+                for r in rows:
+                    did = int(r[0])
+                    if parent_counts.get(did, 0) > 0:
+                        raw_snip = r[4] or ""
+                        clean_snip = clean_normal_text(raw_snip) if raw_snip else ""
+                        resolved_chunks[did] = self._resolve_keyword_parent_chunk(
+                            cursor, did, clean_snip, tokens
+                        )
+            return rows, parent_counts, resolved_chunks
 
         if conn is not None:
-            rows = _exec_search(conn)
+            rows, parent_counts, resolved_chunks = _exec_search(conn)
         else:
             with self.get_connection() as c:
-                rows = _exec_search(c)
+                rows, parent_counts, resolved_chunks = _exec_search(c)
 
         hits = []
         for r in rows:
-            doc_id, url, title, bm25_rank, snippet, summary, doc_date, saved_at, rerank_text = r
-            score = max(0.0, -float(bm25_rank))
+            doc_id, url, title, _bm25_rank, snippet, summary, doc_date, saved_at = r
+            doc_id_int = int(doc_id)
+            total_chunks = parent_counts.get(doc_id_int, 0)
+            clean_snip = clean_normal_text(snippet) if snippet else ""
+            chunk_idx, parent_chunk_text = resolved_chunks.get(doc_id_int, (None, None))
+
+            if chunk_idx is not None and parent_chunk_text:
+                centered = extract_centered_passage(
+                    parent_chunk_text,
+                    clean_snip or query_text,
+                    max_chars=1200,
+                )
+                effective_snippet = centered or clean_snip
+                effective_rerank = centered or clean_snip or (summary.strip() if summary else "")
+            else:
+                effective_snippet = clean_snip
+                effective_rerank = clean_snip or (summary.strip() if summary else "")
+
+            resolved_title = resolve_document_title(
+                title or "",
+                effective_snippet or "",
+                url or "",
+            )
             hits.append({
-                "doc_id": doc_id,
+                "doc_id": doc_id_int,
                 "url": url,
-                "title": title,
-                "snippet": clean_normal_text(snippet) if snippet else "",
+                "title": resolved_title,
+                "snippet": effective_snippet,
                 "summary": summary.strip() if summary else "",
                 "published_date": str(doc_date) if doc_date else "",
                 "saved_at": str(saved_at) if saved_at else "",
-                "rerank_text": rerank_text.strip() if rerank_text else "",
+                "rerank_text": effective_rerank,
+                "chunk_index": chunk_idx,
+                "total_chunks": total_chunks if total_chunks > 0 else None,
             })
         return hits
 
@@ -390,6 +488,10 @@ class Stash:
                         candidate_docs[doc_id]["published_date"] = hit["published_date"]
                     if not candidate_docs[doc_id].get("rerank_text") and hit.get("rerank_text"):
                         candidate_docs[doc_id]["rerank_text"] = hit["rerank_text"]
+                    if candidate_docs[doc_id].get("chunk_index") is None and hit.get("chunk_index") is not None:
+                        candidate_docs[doc_id]["chunk_index"] = hit["chunk_index"]
+                    if not candidate_docs[doc_id].get("total_chunks") and hit.get("total_chunks"):
+                        candidate_docs[doc_id]["total_chunks"] = hit["total_chunks"]
 
             fused = sorted(candidate_docs.keys(), key=lambda did: rrf_scores[did], reverse=True)
             max_rrf = max(rrf_scores.values()) if rrf_scores else 1.0
@@ -452,8 +554,10 @@ class Stash:
                 dt = date.fromisoformat(str(raw_date)[:10]) if raw_date else date.today()
             except Exception:
                 dt = date.today()
-            resolved_title = (h.get("title") or "").strip() or extract_title_from_text(
-                h.get("rerank_text") or h.get("snippet") or "", h.get("url", "")
+            resolved_title = resolve_document_title(
+                h.get("title") or "",
+                h.get("rerank_text") or h.get("snippet") or "",
+                h.get("url", ""),
             )
             out.append(
                 SingleSearchResult(
@@ -464,6 +568,8 @@ class Stash:
                     summary=h.get("summary"),
                     score=float(h.get("score", 0.0)),
                     date=dt,
+                    chunk_index=h.get("chunk_index"),
+                    total_chunks=h.get("total_chunks"),
                 )
             )
         return out
@@ -580,49 +686,49 @@ class Stash:
         self,
         doc_id: int,
         clean: bool = True,
+        chunk_index: int | None = None,
+        window: int = 1,
+        max_chars: int | None = None,
     ) -> dict[str, Any] | None:
-        """Fetch full document content and metadata by doc_id using pooled connection."""
-        sql = """
-        SELECT
-            s.id,
-            s.url,
-            COALESCE(json_extract(s.metadata, '$.title'), '') AS title,
-            COALESCE(ds.summary, '') AS summary,
-            COALESCE(ds.published_date, substr(s.saved_at, 1, 10)) AS published_date,
-            COALESCE(s.markdown, s.html, '') AS content
-        FROM documents s
-        LEFT JOIN document_summaries ds ON ds.doc_id = s.id
-        WHERE s.id = ?
-        LIMIT 1
-        """
-        with self.get_connection() as conn:
-            row = conn.execute(sql, (doc_id,)).fetchone()
-            if not row:
-                return None
-            id_, url, title, summary, pub_date, content = row
-            if clean:
-                content = clean_normal_text(content)
-            return {
-                "doc_id": id_,
-                "url": url,
-                "title": title,
-                "summary": summary if summary else None,
-                "date": str(pub_date) if pub_date else None,
-                "content": content,
-            }
+        """Fetch document content (full for short docs, windowed chunks or budgeted head for long docs) and metadata."""
+        docs = self.get_documents_detail(
+            [doc_id],
+            clean=clean,
+            chunk_index=chunk_index,
+            window=window,
+            max_chars=max_chars,
+        )
+        return docs[0] if docs else None
 
     def get_documents_detail(
         self,
         doc_ids: Sequence[int],
         clean: bool = True,
+        chunk_index: int | None = None,
+        window: int = 1,
+        max_chars: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Fetch full document content and metadata for multiple doc_ids in a single query."""
+        """
+        Fetch document content and metadata for multiple doc_ids with chunk-windowing and batch context protection.
+        Short documents return in full; long documents with `chunk_index` return surrounding neighbor chunks plus
+        a Chunk 0 header preview; long un-indexed documents return a budgeted head with chunk-navigation guidance.
+        """
         if not doc_ids:
             return []
 
-        clean_ids = [int(i) for i in doc_ids if str(i).isdigit() or isinstance(i, int)]
+        clean_ids = list(
+            dict.fromkeys(
+                int(i) for i in doc_ids if isinstance(i, int) or str(i).strip().isdigit()
+            )
+        )
         if not clean_ids:
             return []
+
+        win = max(0, min(int(1 if window is None else window), 5))
+        batch_cap = FETCH_BATCH_MAX_CHARS
+        requested_cap = int(max_chars) if (max_chars is not None and int(max_chars) > 0) else FETCH_DEFAULT_MAX_CHARS
+        per_doc_base = min(requested_cap, batch_cap, max(6000, batch_cap // max(1, len(clean_ids))))
+        remaining_budget = batch_cap
 
         placeholders = ",".join("?" for _ in clean_ids)
         sql = f"""
@@ -637,25 +743,156 @@ class Stash:
         LEFT JOIN document_summaries ds ON ds.doc_id = s.id
         WHERE s.id IN ({placeholders})
         """
+        count_sql = f"""
+        SELECT doc_id, COUNT(*)
+        FROM document_chunks
+        WHERE chunk_type = 'parent' AND doc_id IN ({placeholders})
+        GROUP BY doc_id
+        """
+
+        results: list[dict[str, Any]] = []
         with self.get_connection() as conn:
             rows = conn.execute(sql, clean_ids).fetchall()
+            raw_by_id = {int(r[0]): r for r in rows}
+            count_rows = conn.execute(count_sql, clean_ids).fetchall()
+            parent_counts = {int(did): int(cnt) for did, cnt in count_rows}
 
-        docs_by_id: dict[int, dict[str, Any]] = {}
-        for row in rows:
-            id_, url, title, summary, pub_date, content = row
-            if clean:
-                content = clean_normal_text(content)
-            docs_by_id[id_] = {
-                "doc_id": id_,
-                "url": url,
-                "title": title,
-                "summary": summary if summary else None,
-                "date": str(pub_date) if pub_date else None,
-                "content": content,
-            }
+            for did in clean_ids:
+                row = raw_by_id.get(did)
+                if row is None:
+                    continue
+                id_, url, title, summary, pub_date, raw_content = row
+                raw_text = raw_content or ""
+                resolved_title = resolve_document_title(title or "", raw_text[:2000], url or "")
+                full_text = clean_normal_text(raw_text) if clean else raw_text
+                total_chars = len(full_text)
+                total_chunks = parent_counts.get(did, 0)
+                doc_cap = max(4000, min(per_doc_base, remaining_budget))
 
-        # Preserve the exact requested order
-        return [docs_by_id[did] for did in clean_ids if did in docs_by_id]
+                # Case 1: Short document fits in full
+                if total_chars <= min(FETCH_SHORT_DOC_CHARS, doc_cap) or (
+                    chunk_index is None and total_chars <= doc_cap
+                ):
+                    final_content = full_text
+                    resp_chunk_index = chunk_index
+                    chunk_start = 0 if total_chunks > 0 else None
+                    chunk_end = (total_chunks - 1) if total_chunks > 0 else None
+                    truncated = False
+
+                # Case 2: Windowed chunk fetch around target chunk_index
+                elif chunk_index is not None and total_chunks > 0:
+                    ci = max(0, min(int(chunk_index), total_chunks - 1))
+                    c_start = max(0, ci - win)
+                    c_end = min(total_chunks - 1, ci + win)
+
+                    chunk_rows = conn.execute(
+                        """
+                        SELECT chunk_index, chunk_text
+                        FROM document_chunks
+                        WHERE doc_id = ? AND chunk_type = 'parent' AND chunk_index BETWEEN ? AND ?
+                        ORDER BY chunk_index ASC
+                        """,
+                        (did, c_start, c_end),
+                    ).fetchall()
+
+                    parts: list[str] = []
+                    if c_start > 0:
+                        head_row = conn.execute(
+                            """
+                            SELECT chunk_text
+                            FROM document_chunks
+                            WHERE doc_id = ? AND chunk_type = 'parent' AND chunk_index = 0
+                            LIMIT 1
+                            """,
+                            (did,),
+                        ).fetchone()
+                        if head_row and head_row[0]:
+                            head_text = clean_passage_lines(head_row[0]) if clean else str(head_row[0])
+                            head_preview = _truncate_cleanly(head_text.strip(), 600)
+                            if head_preview:
+                                parts.append(f"[Document Header / Chunk 0 preview]\n{head_preview}")
+
+                    for c_idx, c_text in chunk_rows:
+                        body = (clean_normal_text(c_text) if clean else str(c_text)).strip()
+                        marker = " (matched)" if int(c_idx) == ci else ""
+                        parts.append(f"[Chunk {int(c_idx)} of 0..{total_chunks - 1}]{marker}\n{body}")
+
+                    assembled = "\n\n---\n\n".join(parts) if parts else full_text
+                    is_partial = c_start > 0 or c_end < (total_chunks - 1)
+
+                    footer = ""
+                    if is_partial:
+                        nav_hints: list[str] = []
+                        if c_start > 0:
+                            prev_idx = max(0, c_start - win - 1)
+                            nav_hints.append(f"earlier (0..{c_start - 1}): chunk_index={prev_idx}")
+                        if c_end < total_chunks - 1:
+                            next_idx = min(total_chunks - 1, c_end + win + 1)
+                            nav_hints.append(f"later ({c_end + 1}..{total_chunks - 1}): chunk_index={next_idx}")
+                        footer = (
+                            f"\n\n[Showing chunks {c_start}..{c_end} of 0..{total_chunks - 1}. "
+                            f"Call babel_fetch(doc_ids={did}, chunk_index=..., window={win}) for "
+                            + "; ".join(nav_hints)
+                            + ".]"
+                        )
+
+                    cap_trimmed = False
+                    if len(assembled) + len(footer) > doc_cap:
+                        allow = max(1000, doc_cap - len(footer) - 4)
+                        assembled = _truncate_cleanly(assembled, allow)
+                        cap_trimmed = True
+
+                    final_content = f"{assembled}{footer}" if footer else assembled
+                    resp_chunk_index = ci
+                    chunk_start = c_start
+                    chunk_end = c_end
+                    truncated = is_partial or cap_trimmed
+
+                # Case 3: Long document without chunk_index (or unchunked doc) -> budgeted head + hint
+                else:
+                    footer_reserve = 220 if total_chunks > 0 else 80
+                    text_cap = max(1000, doc_cap - footer_reserve)
+                    cut = full_text[:text_cap]
+                    if len(full_text) > text_cap:
+                        tail_floor = max(len(cut) // 2, len(cut) - 200)
+                        last_ws = max(cut.rfind("\n", tail_floor), cut.rfind(" ", tail_floor))
+                        if last_ws > len(cut) // 2:
+                            cut = cut[:last_ws]
+                    cut = cut.rstrip()
+
+                    if total_chunks > 0:
+                        footer = (
+                            f"\n\n[Truncated at {len(cut):,}/{total_chars:,} chars "
+                            f"({total_chunks} chunks: 0..{total_chunks - 1}). "
+                            f"Call babel_fetch(doc_ids={did}, chunk_index=<N>, window=1) "
+                            f"using the chunk_index from babel_query to read a specific section without truncation.]"
+                        )
+                    else:
+                        footer = f"\n\n[Truncated at {len(cut):,}/{total_chars:,} chars to fit context window.]"
+
+                    final_content = f"{cut}{footer}"
+                    resp_chunk_index = None
+                    chunk_start = 0 if total_chunks > 0 else None
+                    chunk_end = None
+                    truncated = True
+
+                remaining_budget = max(0, remaining_budget - len(final_content))
+                results.append({
+                    "doc_id": int(id_),
+                    "url": url,
+                    "title": resolved_title,
+                    "summary": summary if summary else None,
+                    "date": str(pub_date) if pub_date else None,
+                    "content": final_content,
+                    "chunk_index": resp_chunk_index,
+                    "chunk_start": chunk_start,
+                    "chunk_end": chunk_end,
+                    "total_chunks": total_chunks if total_chunks > 0 else None,
+                    "truncated": truncated,
+                    "total_chars": total_chars,
+                })
+
+        return results
 
     def get_by_url(
         self,

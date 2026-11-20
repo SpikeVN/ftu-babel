@@ -33,7 +33,13 @@ def batch_fetch_documents_post(
             detail="Must provide at least one valid document ID in 'doc_ids' or 'ids'.",
         )
 
-    docs = stash_instance.get_documents_detail(doc_ids=clean_ids, clean=payload.clean)
+    docs = stash_instance.get_documents_detail(
+        doc_ids=clean_ids,
+        clean=payload.clean,
+        chunk_index=payload.chunk_index,
+        window=payload.window,
+        max_chars=payload.max_chars,
+    )
 
     accept_header = request.headers.get("accept", "")
     wants_text = (payload.format == "text") or (
@@ -56,6 +62,9 @@ def batch_fetch_documents_get(
     ids: str = Query(..., description="Comma-separated document IDs, e.g. '1525,1526'"),
     clean: bool = Query(True, description="Whether to strip links, images, and headers so only normal text remains"),
     format: Optional[Literal["json", "text"]] = Query(None, description="Response format: 'json' (default) or 'text' for RAG LLM context"),
+    chunk_index: Optional[int] = Query(None, ge=0, description="Optional 0-based parent chunk index for windowed retrieval"),
+    window: int = Query(1, ge=0, le=5, description="Number of neighboring parent chunks around chunk_index"),
+    max_chars: Optional[int] = Query(None, ge=1000, le=100000, description="Optional maximum character budget per document"),
     stash_instance: Stash = Depends(get_stash),
 ):
     """
@@ -68,7 +77,13 @@ def batch_fetch_documents_get(
             detail="No valid numeric document IDs provided in 'ids'.",
         )
 
-    docs = stash_instance.get_documents_detail(doc_ids=parsed_ids, clean=clean)
+    docs = stash_instance.get_documents_detail(
+        doc_ids=parsed_ids,
+        clean=clean,
+        chunk_index=chunk_index,
+        window=window,
+        max_chars=max_chars,
+    )
 
     accept_header = request.headers.get("accept", "")
     wants_text = (format == "text") or (
@@ -89,10 +104,19 @@ def get_document_endpoint(
     request: Request,
     format: Optional[Literal["json", "text"]] = Query(None, description="Response format: 'json' (default) or 'text' for raw LLM ingestion"),
     clean: bool = Query(True, description="Whether to strip links, images, and headers so only normal text remains"),
+    chunk_index: Optional[int] = Query(None, ge=0, description="Optional 0-based parent chunk index for windowed retrieval"),
+    window: int = Query(1, ge=0, le=5, description="Number of neighboring parent chunks around chunk_index"),
+    max_chars: Optional[int] = Query(None, ge=1000, le=100000, description="Optional maximum character budget"),
     stash_instance: Stash = Depends(get_stash),
 ):
-    """Fetch full content and metadata for a single crawled document by doc_id."""
-    doc = stash_instance.get_document_detail(doc_id=doc_id, clean=clean)
+    """Fetch document content (full or chunk-windowed) and metadata for a single crawled document by doc_id."""
+    doc = stash_instance.get_document_detail(
+        doc_id=doc_id,
+        clean=clean,
+        chunk_index=chunk_index,
+        window=window,
+        max_chars=max_chars,
+    )
     if doc is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -105,16 +129,7 @@ def get_document_endpoint(
     )
 
     if wants_text:
-        header_lines = [
-            f"Title: {doc['title']}",
-            f"URL: {doc['url']}",
-        ]
-        if doc.get("date"):
-            header_lines.append(f"Date: {doc['date']}")
-        if doc.get("summary"):
-            header_lines.append(f"Summary: {doc['summary']}")
-        header_text = "\n".join(header_lines)
-        body = f"{header_text}\n\n{doc['content']}"
+        body = format_documents_as_text([doc])
         return PlainTextResponse(content=body, media_type="text/plain; charset=utf-8")
 
     return DocumentDetailResponse(**doc)

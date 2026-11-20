@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 
+from oui_filter_strip_traces import Filter as StripTracesFilter
 from oui_tool import Tools as BabelToolHandler
 
 OPENWEBUI_ENDPOINT = os.getenv("OPENWEBUI_ENDPOINT", "").rstrip("/")
@@ -96,8 +98,9 @@ BABEL_TOOLS_SPEC: list[dict[str, Any]] = [
         "function": {
             "name": "babel_query",
             "description": (
-                "Search the FTU (Trường Đại học Ngoại thương) knowledge base. "
-                "Returns relevant document passages with their doc_id, title, URL, Cite link, date, and score."
+                "Primary mandatory search tool for the FTU (Trường Đại học Ngoại thương) knowledge base. "
+                "ALWAYS call this before web_search for any FTU or Vietnamese student/university question. "
+                "Returns matched passages with doc_id and Chunk coordinates for targeted babel_fetch."
             ),
             "parameters": {
                 "type": "object",
@@ -136,8 +139,9 @@ BABEL_TOOLS_SPEC: list[dict[str, Any]] = [
         "function": {
             "name": "babel_fetch",
             "description": (
-                "Fetch the full document content and metadata for one or more doc_ids in a single batch request. "
-                "Use when search passages in babel_query lack specific details, or when full text context is needed."
+                "Fetch document content and metadata from Babel. Short documents return in full automatically. "
+                "For long documents, pass chunk_index (from babel_query's Chunk: X of 0..N) plus window (default 1) "
+                "to retrieve the target section and adjacent neighbor chunks without context overflow."
             ),
             "parameters": {
                 "type": "object",
@@ -153,6 +157,19 @@ BABEL_TOOLS_SPEC: list[dict[str, Any]] = [
                     "ids": {
                         **_DOC_ID_SCHEMA,
                         "description": "Optional alias for doc_ids.",
+                    },
+                    "chunk_index": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Optional 0-based chunk index from babel_query's Chunk: X of 0..N line.",
+                    },
+                    "window": {
+                        "type": "integer",
+                        "default": 1,
+                        "description": "Number of neighboring chunks before and after chunk_index to include (0-5, default 1).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Optional per-document character cap override (1000-100000).",
                     },
                     "clean": {
                         "type": "boolean",
@@ -174,8 +191,8 @@ BABEL_TOOLS_SPEC: list[dict[str, Any]] = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the public web for real-time, external, or non-FTU information via SearXNG. "
-                "Use as a fallback when FTU knowledge base (babel_query) does not contain the answer."
+                "FALLBACK ONLY — NEVER call web_search before babel_query for FTU or Vietnamese university questions. "
+                "Search the public web via SearXNG only after babel_query / babel_fetch have run."
             ),
             "parameters": {
                 "type": "object",
@@ -233,6 +250,35 @@ Phân loại verdict:
   "verdict": "CORRECT" | "PARTIAL" | "INCORRECT",
   "reason": "Giải thích ngắn gọn 1-2 câu lý do chấm điểm và nhận xét về dữ kiện."
 }"""
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
+_ORPHAN_THINK_END_RE = re.compile(r"^.*?</think>\s*", flags=re.IGNORECASE | re.DOTALL)
+_DETAILS_TRACE_RE = re.compile(
+    r'<details\b[^>]*type=["\'](?:reasoning|tool_calls)["\'][^>]*>.*?</details>',
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_RAW_TOOL_CALL_TAG_RE = re.compile(
+    r"<tool_call>.*?(?:</tool_call>|$)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_RAW_TOOL_MARKER_RE = re.compile(r"<tool_call\b|<function=", flags=re.IGNORECASE)
+
+
+def sanitize_model_response(text: str) -> str:
+    """Strip leaked thinking traces, reasoning/tool details blocks, and raw XML tool_call tags."""
+    if not text:
+        return ""
+    cleaned = _DETAILS_TRACE_RE.sub("", text)
+    cleaned = _THINK_BLOCK_RE.sub("", cleaned)
+    cleaned = _ORPHAN_THINK_END_RE.sub("", cleaned)
+    cleaned = _RAW_TOOL_CALL_TAG_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def _contains_raw_tool_call(text: str) -> bool:
+    """Return True if text still contains raw XML tool_call or function markers."""
+    return bool(_RAW_TOOL_MARKER_RE.search(text or ""))
 
 
 def strip_json_fences(text: str) -> str:
@@ -417,6 +463,8 @@ async def run_genie_agent_turn(
         local_prompt = SYSTEM_PROMPT.replace("{{CURRENT_DATE}}", current_date)
         messages: list[dict[str, Any]] = [{"role": "system", "content": local_prompt}]
         messages.extend(user_messages)
+        if len(user_messages) > 1:
+            messages = StripTracesFilter().inlet({"messages": messages})["messages"]
         base_payload: dict[str, Any] = {
             "model": model,
             "tools": BABEL_TOOLS_SPEC,
@@ -469,7 +517,12 @@ async def run_genie_agent_turn(
 
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
-                content = (msg.get("content") or "").strip()
+                raw_content = (msg.get("content") or "").strip()
+                cleaned = sanitize_model_response(raw_content)
+                if _contains_raw_tool_call(raw_content) and not cleaned:
+                    _log(f"step {step_idx} emitted raw XML tool tag; falling back to synthesis")
+                    break
+                content = cleaned
                 elapsed = time.time() - t0
                 _log(
                     f"A ({elapsed:.1f}s, {len(executed_tools)} tools, "
@@ -517,8 +570,20 @@ async def run_genie_agent_turn(
         except Exception as exc:
             return _error_result(str(exc))
 
-    # Max tool iterations reached: perform one final synthesis call with tool_choice="none"
-    final_payload = {**base_payload, "messages": messages, "tool_choice": "none"}
+    # Max tool iterations (or raw XML fallback) reached: perform one final synthesis call with tool_choice="none"
+    final_messages = list(messages) + [
+        {
+            "role": "user",
+            "content": (
+                "[Hệ thống: Đã hết lượt gọi công cụ. Không gọi thêm công cụ hay xuất thẻ <tool_call>. "
+                "Hãy trả lời trực tiếp câu hỏi của người dùng dựa trên các kết quả đã tra cứu được; "
+                "nếu chưa tìm thấy thông tin thì nêu rõ không tìm thấy và hướng dẫn liên hệ phòng/ban phù hợp.]"
+            ),
+        }
+    ]
+    final_payload = {**base_payload, "messages": final_messages, "tool_choice": "none"}
+    if use_local_prompt:
+        final_payload.pop("tools", None)
     try:
         r = await post_json_with_retry(
             client, url, headers, final_payload, timeout=timeout, max_retries=max_retries
@@ -529,15 +594,16 @@ async def run_genie_agent_turn(
             usage = data.get("usage") or {}
             total_prompt_tokens += usage.get("prompt_tokens", 0)
             total_completion_tokens += usage.get("completion_tokens", 0)
-            content = (msg.get("content") or "").strip()
-            if not (msg.get("tool_calls") or []) and content:
+            raw_content = (msg.get("content") or "").strip()
+            cleaned = sanitize_model_response(raw_content)
+            if not (msg.get("tool_calls") or []) and cleaned and not _contains_raw_tool_call(cleaned):
                 elapsed = time.time() - t0
                 _log(
                     f"A ({elapsed:.1f}s, {len(executed_tools)} tools, "
-                    f"{total_prompt_tokens}->{total_completion_tokens} tok): {compact_preview(content, 240)}"
+                    f"{total_prompt_tokens}->{total_completion_tokens} tok): {compact_preview(cleaned, 240)}"
                 )
                 return {
-                    "content": content,
+                    "content": cleaned,
                     "latency": elapsed,
                     "prompt_tokens": total_prompt_tokens,
                     "completion_tokens": total_completion_tokens,

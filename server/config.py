@@ -122,7 +122,14 @@ ZEROENTROPY_BASE_URL = (
 ZERANK_MODEL = os.environ.get("ZERANK_MODEL", "zerank-2")
 ZERANK_CANDIDATE_K = int(os.environ.get("ZERANK_CANDIDATE_K", "30"))
 ZERANK_TIMEOUT = float(os.environ.get("ZERANK_TIMEOUT", "45"))
+ZERANK_MAX_CHARS = int(os.environ.get("ZERANK_MAX_CHARS", "1200"))
+ZERANK_MAX_CANDIDATES = int(os.environ.get("ZERANK_MAX_CANDIDATES", "12"))
 RERANK_ENABLED = bool(ZEROENTROPY_API_KEY or _is_local_endpoint(ZEROENTROPY_BASE_URL))
+
+# Document Fetch Context Budgets
+FETCH_SHORT_DOC_CHARS = int(os.environ.get("FETCH_SHORT_DOC_CHARS", "16000"))
+FETCH_DEFAULT_MAX_CHARS = int(os.environ.get("FETCH_DEFAULT_MAX_CHARS", "20000"))
+FETCH_BATCH_MAX_CHARS = int(os.environ.get("FETCH_BATCH_MAX_CHARS", "48000"))
 
 # LLM Summarization Settings
 _llm_base = MOSS_EMBEDDING_ENDPOINT or MOSS_RERANKING_ENDPOINT

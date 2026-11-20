@@ -88,8 +88,23 @@ class Tools:
             return e.code, e.read().decode("utf-8", errors="replace")
 
     @staticmethod
+    def _parse_optional_int(raw: Any) -> Optional[int]:
+        """Safely coerce an int or numeric string to int, returning None if invalid or boolean."""
+        if raw is None or isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            return raw
+        s = str(raw).strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            return None
+
+    @staticmethod
     def _format_results_text(items: list[dict[str, Any]]) -> str:
-        """Format JSON search results into citation-ready plain text with Title and Cite lines."""
+        """Format JSON search results into citation-ready plain text with chunk coordinates, Title, and Cite lines."""
         if not items:
             return "No results found."
         blocks: list[str] = []
@@ -101,8 +116,16 @@ class Tools:
             dt = (item.get("date") or "").strip()
             summary = (item.get("summary") or "").strip()
             content = (item.get("content") or "").strip()
+            chunk_index = item.get("chunk_index")
+            total_chunks = item.get("total_chunks")
             cite_label = (title or url).replace("[", "(").replace("]", ")")
-            lines = [f"[{idx}] Document ID: {doc_id} (Score: {score:.4f})"]
+
+            if chunk_index is not None and total_chunks is not None and int(total_chunks) > 0:
+                header = f"[{idx}] Document ID: {doc_id} (Score: {score:.4f}) | Chunk: {chunk_index} of 0..{int(total_chunks) - 1}"
+            else:
+                header = f"[{idx}] Document ID: {doc_id} (Score: {score:.4f})"
+
+            lines = [header]
             if title:
                 lines.append(f"Title: {title}")
             lines.append(f"URL: {url}")
@@ -113,10 +136,7 @@ class Tools:
             if summary:
                 lines.append(f"Summary (auto-generated): {summary}")
             if content:
-                brief = content.rstrip()
-                if not brief.endswith("..."):
-                    brief += "..."
-                lines.append(f"Brief Content (truncated):\n{brief}")
+                lines.append(f"Matched Passage:\n{content.rstrip()}")
             blocks.append("\n".join(lines))
         return "\n\n---\n\n".join(blocks)
 
@@ -129,8 +149,10 @@ class Tools:
         __event_emitter__: Optional[Callable[[dict[str, Any]], Any]] = None,
     ) -> str:
         """
-        Search the FTU (Trường Đại học Ngoại thương) knowledge base.
-        Returns relevant document passages with their doc_id, title, URL, Cite link, date, and score.
+        Primary mandatory search tool for the FTU (Trường Đại học Ngoại thương) knowledge base.
+        ALWAYS call this before web_search for any FTU or Vietnamese student/university question.
+        Returns matched passages with their doc_id, chunk_index/total_chunks coordinates (for targeted
+        babel_fetch expansion), Title, URL, Cite link, date, and score.
 
         Args:
             query: The search query string (use user's literal wording, typos included).
@@ -143,7 +165,7 @@ class Tools:
             format: Output format, either 'text' (default, citation-ready plain text for LLM) or 'json'.
 
         Returns:
-            Citation-ready passages with doc_id, Title, URL, Cite link, publication date, summary, and clean text content.
+            Citation-ready matched passages with doc_id, Chunk coordinates, Title, URL, Cite link, date, summary, and text.
         """
         base_url = self._base_url()
         endpoint = f"{base_url}/query"
@@ -231,8 +253,9 @@ class Tools:
         __event_emitter__: Optional[Callable[[dict[str, Any]], Any]] = None,
     ) -> str:
         """
-        Search the public web for real-time, external, or non-FTU information via SearXNG.
-        Use as a fallback when FTU knowledge base (babel_query) does not contain the answer.
+        FALLBACK ONLY — NEVER call web_search before babel_query for FTU or Vietnamese university questions.
+        Search the public web via SearXNG only after babel_query / babel_fetch have run and returned
+        insufficient or outdated details, or to cross-check recent external announcements.
 
         Args:
             query: The web search query string.
@@ -290,22 +313,30 @@ class Tools:
         doc_ids: Optional[Union[int, str, list[Union[int, str]]]] = None,
         doc_id: Optional[Union[int, str, list[Union[int, str]]]] = None,
         ids: Optional[Union[list[Union[int, str]], int, str]] = None,
+        chunk_index: Optional[Union[int, str]] = None,
+        window: int = 1,
+        max_chars: Optional[int] = None,
         clean: bool = True,
         format: Literal["text", "json"] = "text",
     ) -> str:
         """
-        Fetch the full document content and metadata for one or more doc_ids in a single batch request.
-        Use when search passages in babel_query lack specific details, or when full text context is needed.
+        Fetch document content and metadata from Babel. Short documents return in full automatically.
+        For long documents, pass `chunk_index` (from babel_query's `Chunk: X of 0..N`) plus `window` (default 1,
+        or 2 for wide tables) to retrieve the target section and its neighboring chunks without context overflow.
+        Multiple single-doc calls with different `chunk_index` values can be issued in parallel.
 
         Args:
             doc_ids: A document ID (e.g., 1525) or list of doc_ids (e.g., [1525, 1526]) returned by babel_query.
             doc_id: Optional alias for a single document ID or list of doc_ids.
             ids: Optional alias for doc_ids.
+            chunk_index: Optional 0-based chunk index from babel_query's `Chunk: X of 0..N` line.
+            window: Number of neighboring chunks before and after `chunk_index` to include (0-5, default 1).
+            max_chars: Optional per-document character cap override (1000-100000).
             clean: Whether to strip links, images, and headers so only normal text remains (default True).
             format: Output format, either 'text' (default, clean plain text) or 'json'.
 
         Returns:
-            Full clean text content of the document(s) along with Title, URL, Date, and Summary.
+            Full text (for short docs) or windowed chunk text + header preview with Title, URL, Date, and Summary.
         """
         # Collect and normalize all requested IDs
         target_ids: list[int] = []
@@ -347,11 +378,23 @@ class Tools:
 
         base_url = self._base_url()
         endpoint = f"{base_url}/docs/fetch"
-        payload = {
+        payload: dict[str, Any] = {
             "doc_ids": target_ids,
             "clean": bool(clean),
             "format": format if format in ("text", "json") else "text",
         }
+
+        parsed_chunk = self._parse_optional_int(chunk_index)
+        if parsed_chunk is not None and parsed_chunk >= 0:
+            payload["chunk_index"] = parsed_chunk
+
+        parsed_window = self._parse_optional_int(window)
+        if parsed_window is not None:
+            payload["window"] = max(0, min(parsed_window, 5))
+
+        parsed_max_chars = self._parse_optional_int(max_chars)
+        if parsed_max_chars is not None and parsed_max_chars > 0:
+            payload["max_chars"] = max(1000, min(parsed_max_chars, 100000))
 
         try:
             status_code, body = self._http_post(endpoint, payload, timeout=60.0)
