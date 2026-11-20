@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Benchmark answer collector and batch job generator.
-Collects answers from both `genie-01-alpha` (with active Babel tool loop)
-and `ftu-assistant` for the FTU500 benchmark.
-Generates an OpenAI/DeepInfra compatible batch job JSONL file for LLM Judge
-(deepseek-ai/DeepSeek-V4-Flash-0731) with float multi-factor scoring.
+Benchmark answer collector and DeepInfra batch job generator.
+Collects answers from `genie-01-alpha` (with active Babel tool loop) and/or
+`ftu-assistant` for the FTU500 benchmark, and generates an OpenAI/DeepInfra
+Batch API JSONL file for LLM Judge (deepseek-ai/DeepSeek-V4-Flash-0731).
 """
 
 from __future__ import annotations
@@ -12,293 +11,101 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from dotenv import load_dotenv
+from tqdm import tqdm as sync_tqdm
 from tqdm.asyncio import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 
-from oui_tool import Tools as BabelToolHandler
-
-OPENWEBUI_ENDPOINT = os.getenv("OPENWEBUI_ENDPOINT", "").rstrip("/")
-OPENWEBUI_KEY = os.getenv("OPENWEBUI_KEY", "")
-DEEPINFRA_AUTH_TOKEN = os.getenv("DEEPINFRA_AUTH_TOKEN", "")
+from bench.run_benchmark import (  # noqa: E402
+    ANSI_BLUE,
+    BABEL_TOOLS_SPEC,
+    DEEPINFRA_AUTH_TOKEN,
+    DEFAULT_JUDGE_MODEL as JUDGE_MODEL,
+    DEFAULT_TOOL_IDS,
+    JUDGE_SYSTEM_PROMPT,
+    OPENWEBUI_ENDPOINT,
+    OPENWEBUI_KEY,
+    SYSTEM_PROMPT as GENIE_SYSTEM_PROMPT,
+    compact_preview,
+    execute_tool_call,
+    extract_user_messages,
+    format_colored_log,
+    format_question_for_judge,
+    post_json_with_retry,
+    run_genie_agent_turn,
+)
+from oui_tool import Tools as BabelToolHandler  # noqa: E402
 
 DEEPINFRA_API_URL = "https://api.deepinfra.com/v1"
-JUDGE_MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
-
-SYSTEM_PROMPT_PATH = PROJECT_ROOT / "SYSTEM_PROMPT.md"
-if SYSTEM_PROMPT_PATH.exists():
-    GENIE_SYSTEM_PROMPT = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip()
-else:
-    GENIE_SYSTEM_PROMPT = (
-        "Genie is the assistant for FTU (Trường Đại học Ngoại thương). "
-        "Answers FTU facts using only tool results retrieved via babel_query and babel_fetch."
-    )
-
-BABEL_TOOLS_SPEC = [
-    {
-        "type": "function",
-        "function": {
-            "name": "babel_query",
-            "description": (
-                "Search the FTU (Trường Đại học Ngoại thương) knowledge base. "
-                "Returns relevant document passages with their doc_id, title, URL, date, and score."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query string (use user's literal wording, typos included)."
-                    },
-                    "mode": {
-                        "type": "string",
-                        "default": "semantic",
-                        "enum": ["semantic", "keyword", "hybrid"],
-                        "description": "Search mode: semantic, keyword, or hybrid."
-                    },
-                    "top_k": {
-                        "type": "integer",
-                        "default": 10,
-                        "description": "Maximum number of passage results to return."
-                    },
-                    "format": {
-                        "type": "string",
-                        "default": "text",
-                        "enum": ["text", "json"],
-                        "description": "Output format."
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "babel_fetch",
-            "description": (
-                "Fetch the full document content and metadata for one or more doc_ids in a single batch request."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "doc_id": {
-                        "type": "integer",
-                        "description": "A single document ID or list of doc_ids returned by babel_query."
-                    },
-                    "ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "List of doc_ids to fetch in batch."
-                    },
-                    "format": {
-                        "type": "string",
-                        "default": "text",
-                        "enum": ["text", "json"]
-                    }
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the public web for real-time, external, or non-FTU information via SearXNG. "
-                "Use as fallback when FTU knowledge base (babel_query) does not contain the answer."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The web search query string."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 5,
-                        "description": "Maximum number of search results to return."
-                    },
-                    "format": {
-                        "type": "string",
-                        "default": "text",
-                        "enum": ["text", "json"]
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    }
-]
-
-JUDGE_SYSTEM_PROMPT = """Bạn là giám khảo LLM (LLM Judge) chuyên nghiệp, công tâm, khách quan và nghiêm ngặt.
-Nhiệm vụ của bạn là đánh giá câu trả lời của Trợ lý AI (Model Response) dựa trên Câu hỏi, Đáp án tham chiếu (Ground Truth), Hành vi kỳ vọng (Expected Behavior) và Hướng dẫn chấm (Grading Notes) theo thang điểm đa nhân tố dạng số thực (Float Multi-Factor Scoring) từ 0.00 đến 1.00.
-
-Các nhân tố đánh giá (0.00 đến 1.00):
-1. factual_accuracy (0.00 - 1.00): Tính chính xác của các dữ kiện cốt lõi (con số, ngày tháng, tên người, cơ sở, sự kiện, chính sách). 1.0 = hoàn toàn chuẩn xác; 0.0 = sai lệch dữ kiện chính; 0.5 = đúng được một nửa ý chính.
-2. groundedness (0.00 - 1.00): Mức độ trung thực và phi bịa đặt (hallucination-free). 1.0 = không có bất kỳ thông tin bịa đặt nào; 0.0 = tự bịa đặt trắng trợn các dữ kiện không có thật.
-3. completeness (0.00 - 1.00): Độ bao quát đầy đủ các ý cốt lõi theo Ground Truth và Grading Notes.
-4. adherence (0.00 - 1.00): Tuân thủ chặt chẽ Hành vi kỳ vọng (Expected Behavior: 'answer', 'refuse_no_info', 'correct_premise', 'out_of_scope'):
-   - 'answer': phải cung cấp câu trả lời rõ ràng.
-   - 'refuse_no_info': phải thừa nhận không có/chưa có thông tin hoặc đề nghị kiểm tra kênh chính thống; không được bịa chi tiết.
-   - 'correct_premise': phải chỉ ra tiền đề sai và đính chính theo thực tế; không được hùa theo tiền đề sai.
-   - 'out_of_scope': phải từ chối lịch sự hoặc chuyển hướng phù hợp.
-
-Công thức tính điểm tổng hợp:
-final_score = round(0.45 * factual_accuracy + 0.25 * groundedness + 0.15 * completeness + 0.15 * adherence, 2)
-
-Phân loại verdict:
-- "CORRECT": final_score >= 0.80
-- "PARTIAL": 0.40 <= final_score < 0.80
-- "INCORRECT": final_score < 0.40
-
-Định dạng đầu ra BẮT BUỘC là JSON duy nhất:
-{
-  "factual_accuracy": float,
-  "groundedness": float,
-  "completeness": float,
-  "adherence": float,
-  "final_score": float,
-  "verdict": "CORRECT" | "PARTIAL" | "INCORRECT",
-  "reason": "Giải thích ngắn gọn 1-2 câu lý do chấm điểm và nhận xét về dữ kiện."
-}"""
-
-
-async def execute_tool_call(tool_handler: BabelToolHandler, name: str, args_str: str) -> str:
-    """Execute a tool call using Babel."""
-    try:
-        args = json.loads(args_str) if isinstance(args_str, str) else args_str
-    except Exception as e:
-        return f"Error parsing tool arguments: {e}"
-
-    try:
-        if name == "babel_query":
-            return await asyncio.to_thread(tool_handler.babel_query, **args)
-        elif name == "babel_fetch":
-            return await asyncio.to_thread(tool_handler.babel_fetch, **args)
-        elif name == "web_search":
-            return await asyncio.to_thread(tool_handler.web_search, **args)
-        else:
-            return f"Error: Tool '{name}' not found."
-    except Exception as exc:
-        return f"Tool execution error: {exc}"
+SUPPORTED_MODELS = ("genie-01-alpha", "ftu-assistant")
 
 
 async def call_genie_with_babel(
     client: httpx.AsyncClient,
     messages: list[dict[str, Any]],
     tool_handler: BabelToolHandler,
-    max_tool_iterations: int = 5,
-    timeout: float = 60.0,
+    max_tool_iterations: int = 8,
+    timeout: float = 90.0,
+    use_local_prompt: bool = False,
+    tool_ids: list[str] | None = None,
+    item_id: str | None = None,
+    log_fn: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Call Genie Alpha with active Babel tool execution loop."""
-    headers = {
-        "Authorization": f"Bearer {OPENWEBUI_KEY}",
-        "Content-Type": "application/json",
-    }
-    url = f"{OPENWEBUI_ENDPOINT}/api/chat/completions"
-
-    full_messages: list[dict[str, Any]] = [{"role": "system", "content": GENIE_SYSTEM_PROMPT}]
-    full_messages.extend(messages)
-
-    t0 = time.time()
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-    executed_tools: list[dict[str, Any]] = []
-
-    for _ in range(max_tool_iterations):
-        payload = {
-            "model": "genie-01-alpha",
-            "messages": full_messages,
-            "tools": BABEL_TOOLS_SPEC,
-            "stream": False,
-        }
-
-        try:
-            r = await client.post(url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code != 200:
-                return {
-                    "content": "",
-                    "latency": time.time() - t0,
-                    "prompt_tokens": total_prompt_tokens,
-                    "completion_tokens": total_completion_tokens,
-                    "tools": executed_tools,
-                    "error": f"HTTP {r.status_code}: {r.text[:200]}",
-                }
-
-            data = r.json()
-            choice = data["choices"][0]
-            msg = choice.get("message", {})
-            usage = data.get("usage", {})
-            total_prompt_tokens += usage.get("prompt_tokens", 0)
-            total_completion_tokens += usage.get("completion_tokens", 0)
-
-            tool_calls = msg.get("tool_calls")
-            if not tool_calls:
-                return {
-                    "content": (msg.get("content") or "").strip(),
-                    "latency": time.time() - t0,
-                    "prompt_tokens": total_prompt_tokens,
-                    "completion_tokens": total_completion_tokens,
-                    "tools": executed_tools,
-                    "error": None,
-                }
-
-            full_messages.append(msg)
-            for tc in tool_calls:
-                fn_name = tc.get("function", {}).get("name", "")
-                fn_args = tc.get("function", {}).get("arguments", "{}")
-                executed_tools.append({"name": fn_name, "args": fn_args})
-
-                res_str = await execute_tool_call(tool_handler, fn_name, fn_args)
-                full_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id"),
-                    "content": res_str,
-                })
-
-        except Exception as exc:
-            return {
-                "content": "",
-                "latency": time.time() - t0,
-                "prompt_tokens": total_prompt_tokens,
-                "completion_tokens": total_completion_tokens,
-                "tools": executed_tools,
-                "error": str(exc),
-            }
-
+    """Call Genie Alpha with active parallel Babel tool execution loop."""
+    res = await run_genie_agent_turn(
+        client=client,
+        model="genie-01-alpha",
+        user_messages=messages,
+        tool_handler=tool_handler,
+        max_tool_iterations=max_tool_iterations,
+        timeout=timeout,
+        use_local_prompt=use_local_prompt,
+        tool_ids=tool_ids,
+        item_id=item_id,
+        log_fn=log_fn,
+    )
     return {
-        "content": (full_messages[-1].get("content") or "").strip(),
-        "latency": time.time() - t0,
-        "prompt_tokens": total_prompt_tokens,
-        "completion_tokens": total_completion_tokens,
-        "tools": executed_tools,
-        "error": "Max tool iterations reached",
+        "content": res["content"],
+        "latency": res["latency"],
+        "prompt_tokens": res["prompt_tokens"],
+        "completion_tokens": res["completion_tokens"],
+        "tools": res["tools_called"],
+        "error": res["error"],
     }
 
 
 async def call_ftu_assistant(
     client: httpx.AsyncClient,
     messages: list[dict[str, Any]],
-    timeout: float = 60.0,
+    timeout: float = 90.0,
+    max_retries: int = 3,
+    item_id: str | None = None,
+    log_fn: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Call FTU Assistant model on OpenWebUI."""
+    """Call FTU Assistant model on OpenWebUI with transient retry handling."""
+    prefix = f"[ftu-assistant][{item_id}]" if item_id else "[ftu-assistant]"
+
+    def _log(text: str) -> None:
+        if log_fn is not None:
+            log_fn(format_colored_log(f"{prefix} {text}", ANSI_BLUE))
+
     headers = {
         "Authorization": f"Bearer {OPENWEBUI_KEY}",
         "Content-Type": "application/json",
     }
     url = f"{OPENWEBUI_ENDPOINT}/api/chat/completions"
+
+    last_user_msg = (messages[-1].get("content") or "") if messages else ""
+    _log(f"Q: {compact_preview(last_user_msg, 160)}")
 
     t0 = time.time()
     payload = {
@@ -308,32 +115,41 @@ async def call_ftu_assistant(
     }
 
     try:
-        r = await client.post(url, headers=headers, json=payload, timeout=timeout)
+        r = await post_json_with_retry(
+            client, url, headers, payload, timeout=timeout, max_retries=max_retries
+        )
         latency = time.time() - t0
         if r.status_code == 200:
             data = r.json()
             choice = data["choices"][0]
             msg = choice.get("message", {})
-            usage = data.get("usage", {})
+            usage = data.get("usage") or {}
+            content = (msg.get("content") or "").strip()
+            prompt_toks = usage.get("prompt_tokens", 0)
+            completion_toks = usage.get("completion_tokens", 0)
+            _log(f"A ({latency:.1f}s, {prompt_toks}->{completion_toks} tok): {compact_preview(content, 240)}")
             return {
-                "content": (msg.get("content") or "").strip(),
+                "content": content,
                 "latency": latency,
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
+                "prompt_tokens": prompt_toks,
+                "completion_tokens": completion_toks,
                 "error": None,
             }
-        else:
-            return {
-                "content": "",
-                "latency": latency,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "error": f"HTTP {r.status_code}: {r.text[:200]}",
-            }
-    except Exception as exc:
+        err_msg = f"HTTP {r.status_code}: {r.text[:200]}"
+        _log(f"ERR ({latency:.1f}s): {compact_preview(err_msg, 200)}")
         return {
             "content": "",
-            "latency": time.time() - t0,
+            "latency": latency,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "error": err_msg,
+        }
+    except Exception as exc:
+        latency = time.time() - t0
+        _log(f"ERR ({latency:.1f}s): {compact_preview(str(exc), 200)}")
+        return {
+            "content": "",
+            "latency": latency,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "error": str(exc),
@@ -345,45 +161,111 @@ async def process_item(
     client: httpx.AsyncClient,
     tool_handler: BabelToolHandler,
     sem: asyncio.Semaphore,
+    *,
+    selected_models: list[str] | None = None,
+    use_local_prompt: bool = False,
+    tool_ids: list[str] | None = None,
+    max_tool_iterations: int = 8,
+    existing_record: dict[str, Any] | None = None,
+    log_fn: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Collect responses from both models for a single question."""
+    """Collect responses from the selected models for a single benchmark question."""
+    models = selected_models or list(SUPPORTED_MODELS)
+
     async with sem:
-        if item.get("conversation"):
-            messages = item["conversation"]
-            q_text = item["conversation"][-1]["content"] if item["conversation"] else item.get("question", "")
-        else:
-            q_text = item.get("question", "")
-            messages = [{"role": "user", "content": q_text}]
+        messages, q_text = extract_user_messages(item)
 
-        # Run both model queries concurrently
-        genie_task = call_genie_with_babel(client, messages, tool_handler)
-        ftu_task = call_ftu_assistant(client, messages)
+        genie_res: dict[str, Any] | None = None
+        ftu_res: dict[str, Any] | None = None
 
-        genie_res, ftu_res = await asyncio.gather(genie_task, ftu_task)
+        tasks: list[tuple[str, Any]] = []
+        if "genie-01-alpha" in models:
+            tasks.append((
+                "genie-01-alpha",
+                call_genie_with_babel(
+                    client,
+                    messages,
+                    tool_handler,
+                    max_tool_iterations=max_tool_iterations,
+                    use_local_prompt=use_local_prompt,
+                    tool_ids=tool_ids,
+                    item_id=item["id"],
+                    log_fn=log_fn,
+                ),
+            ))
+        if "ftu-assistant" in models:
+            tasks.append((
+                "ftu-assistant",
+                call_ftu_assistant(
+                    client,
+                    messages,
+                    item_id=item["id"],
+                    log_fn=log_fn,
+                ),
+            ))
 
-        return {
+        results = await asyncio.gather(*(coro for _, coro in tasks))
+        for name, res in zip((n for n, _ in tasks), results):
+            if name == "genie-01-alpha":
+                genie_res = res
+            elif name == "ftu-assistant":
+                ftu_res = res
+
+        prev = existing_record or {}
+        record: dict[str, Any] = {
             "id": item["id"],
             "type": item.get("type"),
             "subtype": item.get("subtype"),
             "difficulty": item.get("difficulty"),
             "category": item.get("category"),
             "question": q_text,
+            "question_for_judge": format_question_for_judge(item),
+            "conversation": item.get("conversation"),
             "answer": item.get("answer", ""),
             "expected_behavior": item.get("expected_behavior", "answer"),
             "grading_notes": item.get("grading_notes", ""),
             "sources": item.get("sources", []),
-            "genie_output": genie_res["content"],
-            "genie_latency_sec": round(genie_res["latency"], 3),
-            "genie_tools": genie_res.get("tools", []),
-            "genie_prompt_tokens": genie_res["prompt_tokens"],
-            "genie_completion_tokens": genie_res["completion_tokens"],
-            "genie_error": genie_res["error"],
-            "ftu_assistant_output": ftu_res["content"],
-            "ftu_assistant_latency_sec": round(ftu_res["latency"], 3),
-            "ftu_assistant_prompt_tokens": ftu_res["prompt_tokens"],
-            "ftu_assistant_completion_tokens": ftu_res["completion_tokens"],
-            "ftu_assistant_error": ftu_res["error"],
         }
+
+        if genie_res is not None:
+            record.update({
+                "genie_output": genie_res["content"],
+                "genie_latency_sec": round(genie_res["latency"], 3),
+                "genie_tools": genie_res.get("tools", []),
+                "genie_prompt_tokens": genie_res["prompt_tokens"],
+                "genie_completion_tokens": genie_res["completion_tokens"],
+                "genie_error": genie_res["error"],
+            })
+        elif "genie_output" in prev:
+            for k in (
+                "genie_output",
+                "genie_latency_sec",
+                "genie_tools",
+                "genie_prompt_tokens",
+                "genie_completion_tokens",
+                "genie_error",
+            ):
+                record[k] = prev.get(k)
+
+        if ftu_res is not None:
+            record.update({
+                "ftu_assistant_output": ftu_res["content"],
+                "ftu_assistant_latency_sec": round(ftu_res["latency"], 3),
+                "ftu_assistant_prompt_tokens": ftu_res["prompt_tokens"],
+                "ftu_assistant_completion_tokens": ftu_res["completion_tokens"],
+                "ftu_assistant_error": ftu_res["error"],
+            })
+        elif "ftu_assistant_output" in prev:
+            for k in (
+                "ftu_assistant_output",
+                "ftu_assistant_latency_sec",
+                "ftu_assistant_prompt_tokens",
+                "ftu_assistant_completion_tokens",
+                "ftu_assistant_error",
+            ):
+                record[k] = prev.get(k)
+
+        return record
 
 
 def make_judge_request(
@@ -412,57 +294,107 @@ def make_judge_request(
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.0,
-            "max_tokens": 350,
+            "max_tokens": 512,
             "response_format": {"type": "json_object"},
         },
     }
 
 
-def generate_batch_file(collected_file: Path, batch_output_file: Path) -> int:
-    """Generate the standard OpenAI/DeepInfra Batch API input JSONL file from collected responses."""
-    count = 0
-    with open(collected_file, "r", encoding="utf-8") as fin, open(batch_output_file, "w", encoding="utf-8") as fout:
+def _model_response_fields(model_name: str) -> tuple[str, str]:
+    if model_name == "genie-01-alpha":
+        return "genie_output", "genie_error"
+    if model_name == "ftu-assistant":
+        return "ftu_assistant_output", "ftu_assistant_error"
+    raise ValueError(f"Unsupported model: {model_name}")
+
+
+def _item_models_succeeded(record: dict[str, Any], selected_models: list[str]) -> bool:
+    for model_name in selected_models:
+        out_key, err_key = _model_response_fields(model_name)
+        if record.get(err_key) or not (record.get(out_key) or "").strip():
+            return False
+    return True
+
+
+def generate_batch_file(
+    collected_file: Path,
+    batch_output_file: Path,
+    selected_models: list[str] | None = None,
+    bench_by_id: dict[str, dict[str, Any]] | None = None,
+) -> tuple[int, int]:
+    """
+    Generate the DeepInfra/OpenAI Batch API input JSONL from collected responses.
+    Deduplicates collected records by `id` (latest wins) and skips errored/empty responses.
+    Returns (emitted_count, skipped_count).
+    """
+    models = selected_models or list(SUPPORTED_MODELS)
+    records_by_id: dict[str, dict[str, Any]] = {}
+
+    with open(collected_file, "r", encoding="utf-8") as fin:
         for line in fin:
             line = line.strip()
             if not line:
                 continue
-            rec = json.loads(line)
-            qid = rec["id"]
-            q = rec["question"]
-            gt = rec["answer"]
+            try:
+                rec = json.loads(line)
+                if "id" in rec:
+                    records_by_id[rec["id"]] = rec
+            except Exception:
+                pass
+
+    emitted = 0
+    skipped = 0
+    batch_output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(batch_output_file, "w", encoding="utf-8") as fout:
+        for qid, rec in sync_tqdm(
+            records_by_id.items(),
+            total=len(records_by_id),
+            desc="Generating Batch JSONL",
+            unit="item",
+        ):
+            if rec.get("question_for_judge"):
+                judge_q = rec["question_for_judge"]
+            elif rec.get("conversation"):
+                judge_q = format_question_for_judge(rec)
+            elif bench_by_id and qid in bench_by_id:
+                judge_q = format_question_for_judge(bench_by_id[qid])
+            else:
+                judge_q = rec.get("question", "")
+
+            gt = rec.get("answer", "")
             eb = rec.get("expected_behavior", "answer")
             gn = rec.get("grading_notes", "")
 
-            # 1. Judge request for Genie Alpha
-            req_genie = make_judge_request(
-                custom_id=f"genie-01-alpha__{qid}",
-                question=q,
-                ground_truth=gt,
-                expected_behavior=eb,
-                grading_notes=gn,
-                model_response=rec.get("genie_output", ""),
-            )
-            fout.write(json.dumps(req_genie, ensure_ascii=False) + "\n")
-            count += 1
+            for model_name in models:
+                out_key, err_key = _model_response_fields(model_name)
+                output_text = (rec.get(out_key) or "").strip()
+                err_val = rec.get(err_key)
+                if err_val or not output_text:
+                    skipped += 1
+                    continue
 
-            # 2. Judge request for FTU Assistant
-            req_ftu = make_judge_request(
-                custom_id=f"ftu-assistant__{qid}",
-                question=q,
-                ground_truth=gt,
-                expected_behavior=eb,
-                grading_notes=gn,
-                model_response=rec.get("ftu_assistant_output", ""),
-            )
-            fout.write(json.dumps(req_ftu, ensure_ascii=False) + "\n")
-            count += 1
+                req = make_judge_request(
+                    custom_id=f"{model_name}__{qid}",
+                    question=judge_q,
+                    ground_truth=gt,
+                    expected_behavior=eb,
+                    grading_notes=gn,
+                    model_response=output_text,
+                )
+                fout.write(json.dumps(req, ensure_ascii=False) + "\n")
+                emitted += 1
 
-    return count
+    return emitted, skipped
 
 
-async def upload_and_create_deepinfra_batch(batch_file: Path) -> dict[str, Any]:
+async def upload_and_create_deepinfra_batch(
+    batch_file: Path,
+    selected_models: list[str] | None = None,
+) -> dict[str, Any]:
     """Upload batch file and submit batch job to DeepInfra /v1/batches."""
     headers = {"Authorization": f"Bearer {DEEPINFRA_AUTH_TOKEN}"}
+    models_str = ",".join(selected_models or list(SUPPORTED_MODELS))
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         print(f"Uploading {batch_file} to DeepInfra /v1/files...")
@@ -485,7 +417,7 @@ async def upload_and_create_deepinfra_batch(batch_file: Path) -> dict[str, Any]:
             "completion_window": "24h",
             "metadata": {
                 "benchmark": "FTU500",
-                "models": "genie-01-alpha,ftu-assistant",
+                "models": models_str,
                 "judge": JUDGE_MODEL,
             },
         }
@@ -499,15 +431,46 @@ async def upload_and_create_deepinfra_batch(batch_file: Path) -> dict[str, Any]:
         return batch_info
 
 
-async def main():
+async def main() -> None:
     parser = argparse.ArgumentParser(description="Collect answers and create DeepInfra/OpenAI batch job")
     parser.add_argument("--bench-file", default="bench/ftu500.json", help="Path to benchmark JSON")
     parser.add_argument("--output-collected", default="bench/collected_answers.jsonl", help="Collected answers JSONL")
     parser.add_argument("--output-batch", default="bench/judge_batch_input.jsonl", help="Batch requests JSONL")
-    parser.add_argument("--concurrency", type=int, default=5, help="Number of concurrent requests")
+    parser.add_argument(
+        "--models",
+        default=",".join(SUPPORTED_MODELS),
+        help="Comma-separated models to collect (genie-01-alpha,ftu-assistant)",
+    )
+    parser.add_argument("--concurrency", type=int, default=4, help="Number of concurrent requests")
     parser.add_argument("--limit", type=int, default=0, help="Optional limit for testing")
+    parser.add_argument("--ids", default="", help="Comma-separated question IDs to run (e.g. Q001,MT-001)")
+    parser.add_argument(
+        "--use-local-prompt",
+        action="store_true",
+        help="Send local SYSTEM_PROMPT.md and BABEL_TOOLS_SPEC instead of OpenWebUI server-side prompt & tool_ids",
+    )
+    parser.add_argument(
+        "--tool-ids",
+        default=",".join(DEFAULT_TOOL_IDS),
+        help="Comma-separated OpenWebUI tool IDs for genie-01-alpha (used when --use-local-prompt is off)",
+    )
+    parser.add_argument("--max-tool-iterations", type=int, default=8, help="Max tool-calling rounds for genie-01-alpha")
+    parser.add_argument("--quiet", action="store_true", help="Disable live colored chat and tool logs")
     parser.add_argument("--submit", action="store_true", help="Submit batch to DeepInfra /v1/batches")
     args = parser.parse_args()
+
+    selected_models = [m.strip() for m in args.models.split(",") if m.strip()]
+    invalid_models = [m for m in selected_models if m not in SUPPORTED_MODELS]
+    if not selected_models or invalid_models:
+        print(f"Error: Unsupported --models {invalid_models or selected_models}. Choose from {list(SUPPORTED_MODELS)}.")
+        sys.exit(1)
+
+    if not OPENWEBUI_ENDPOINT or not OPENWEBUI_KEY:
+        print("Error: OPENWEBUI_ENDPOINT and OPENWEBUI_KEY must be set in .env or environment.")
+        sys.exit(1)
+    if args.submit and not DEEPINFRA_AUTH_TOKEN:
+        print("Error: DEEPINFRA_AUTH_TOKEN must be set when using --submit.")
+        sys.exit(1)
 
     bench_path = Path(args.bench_file)
     if not bench_path.exists():
@@ -515,59 +478,115 @@ async def main():
         sys.exit(1)
 
     with open(bench_path, "r", encoding="utf-8") as f:
-        data: list[dict[str, Any]] = json.load(f)
+        full_data: list[dict[str, Any]] = json.load(f)
 
+    bench_by_id = {d["id"]: d for d in full_data}
+    data = list(full_data)
+    if args.ids.strip():
+        wanted_ids = {qid.strip() for qid in args.ids.split(",") if qid.strip()}
+        data = [d for d in data if d["id"] in wanted_ids]
     if args.limit > 0:
         data = data[: args.limit]
+    if not data:
+        print("Error: No benchmark items matched the selection.")
+        sys.exit(1)
+
+    tool_ids = [t.strip() for t in args.tool_ids.split(",") if t.strip()]
+    target_ids = {d["id"] for d in data}
 
     collected_path = Path(args.output_collected)
-    completed_ids = set()
+    collected_path.parent.mkdir(parents=True, exist_ok=True)
+
+    records_by_id: dict[str, dict[str, Any]] = {}
     if collected_path.exists():
         with open(collected_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    try:
-                        record = json.loads(line)
-                        completed_ids.add(record["id"])
-                    except Exception:
-                        pass
-        print(f"Resuming: Found {len(completed_ids)} already collected items.")
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    if "id" in record:
+                        records_by_id[record["id"]] = record
+                except Exception:
+                    pass
+
+    completed_ids = {
+        qid for qid, rec in records_by_id.items()
+        if qid in target_ids and _item_models_succeeded(rec, selected_models)
+    }
+    if records_by_id:
+        print(
+            f"Resuming: Found {len(completed_ids)} already completed items for {selected_models} "
+            f"(out of {len(records_by_id)} records)."
+        )
 
     remaining_items = [d for d in data if d["id"] not in completed_ids]
-    print(f"Total benchmark items: {len(data)} | Remaining to collect: {len(remaining_items)}")
+    print(f"Models: {selected_models} | Total items: {len(data)} | Remaining to collect: {len(remaining_items)}")
 
     if remaining_items:
         sem = asyncio.Semaphore(args.concurrency)
         tool_handler = BabelToolHandler()
-        out_file = open(collected_path, "a" if completed_ids else "w", encoding="utf-8")
+        file_mode = "a" if collected_path.exists() and records_by_id else "w"
 
         async with httpx.AsyncClient(timeout=120.0) as client:
-            pbar = tqdm(total=len(data), initial=len(completed_ids), desc="Collecting Answers")
+            with open(collected_path, file_mode, encoding="utf-8") as out_file:
+                pbar = tqdm(
+                    total=len(data),
+                    initial=len(completed_ids),
+                    desc="Collecting Answers",
+                    dynamic_ncols=True,
+                )
+                log_fn = None if args.quiet else (lambda msg: pbar.write(msg, file=sys.stderr))
 
-            async def worker(item: dict[str, Any]):
-                res = await process_item(item, client, tool_handler, sem)
-                out_file.write(json.dumps(res, ensure_ascii=False) + "\n")
-                out_file.flush()
-                pbar.update(1)
+                async def worker(item: dict[str, Any]) -> None:
+                    res = await process_item(
+                        item,
+                        client,
+                        tool_handler,
+                        sem,
+                        selected_models=selected_models,
+                        use_local_prompt=args.use_local_prompt,
+                        tool_ids=tool_ids,
+                        max_tool_iterations=args.max_tool_iterations,
+                        existing_record=records_by_id.get(item["id"]),
+                        log_fn=log_fn,
+                    )
+                    out_file.write(json.dumps(res, ensure_ascii=False) + "\n")
+                    out_file.flush()
+                    records_by_id[res["id"]] = res
+                    pbar.update(1)
 
-            tasks = [worker(item) for item in remaining_items]
-            await asyncio.gather(*tasks)
-            pbar.close()
+                    target_recs = [r for qid, r in records_by_id.items() if qid in target_ids]
+                    ok_count = sum(1 for r in target_recs if _item_models_succeeded(r, selected_models))
+                    err_count = len(target_recs) - ok_count
+                    postfix: dict[str, Any] = {"ok": ok_count, "errs": err_count}
+                    if "genie-01-alpha" in selected_models:
+                        postfix["tools"] = len(res.get("genie_tools") or [])
+                    pbar.set_postfix(postfix)
 
-        out_file.close()
+                await asyncio.gather(*(worker(item) for item in remaining_items))
+                pbar.close()
 
     print(f"\nGenerating OpenAI/DeepInfra compatible batch file: {args.output_batch}...")
     batch_path = Path(args.output_batch)
-    total_reqs = generate_batch_file(collected_path, batch_path)
-    print(f"Successfully generated {total_reqs} batch requests in {batch_path}")
+    total_reqs, skipped_reqs = generate_batch_file(
+        collected_path,
+        batch_path,
+        selected_models=selected_models,
+        bench_by_id=bench_by_id,
+    )
+    print(f"Successfully generated {total_reqs} batch requests in {batch_path} (skipped {skipped_reqs} errored/empty).")
 
     if args.submit:
-        batch_res = await upload_and_create_deepinfra_batch(batch_path)
+        if total_reqs == 0:
+            print("Error: Batch file contains 0 requests; skipping upload.")
+            sys.exit(1)
+        batch_res = await upload_and_create_deepinfra_batch(batch_path, selected_models=selected_models)
         batch_id = batch_res.get("id")
         print(f"\nBatch ID: {batch_id}")
-        print(f"Check status with:")
-        print(f"  curl -s -H 'Authorization: Bearer $DEEPINFRA_AUTH_TOKEN' https://api.deepinfra.com/v1/batches/{batch_id}")
+        print("Download & score when complete with:")
+        print(f"  .venv/bin/python bench/score_batch_results.py --batch-id {batch_id} --collected {collected_path}")
 
 
 if __name__ == "__main__":

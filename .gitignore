@@ -19,8 +19,11 @@ stash.db
 *.zip
 
 # Benchmark data and result files
+BATCH_ID
+bench/BATCH_ID
 bench/*.jsonl
 bench/*.json
+bench/archive/
 !bench/ftu500.json
 
 # SQLite database files

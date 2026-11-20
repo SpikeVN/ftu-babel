@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from tqdm import tqdm
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -67,7 +69,8 @@ def evaluate_retrieval(
     print(f"Parameters: top_k={top_k}, hybrid_blend={hybrid_blend}")
     print("-" * 65)
 
-    for idx, item in enumerate(data, 1):
+    pbar = tqdm(enumerate(data, 1), total=total, desc="Evaluating Retrieval", unit="q")
+    for idx, item in pbar:
         qid = item["id"]
         question = item.get("question") or item.get("question_formal") or ""
         ground_truth_answer = (item.get("answer") or "").strip().lower()
@@ -81,7 +84,7 @@ def evaluate_retrieval(
                 hybrid_blend=hybrid_blend,
             )
         except Exception as exc:
-            print(f"Error querying {qid}: {exc}")
+            pbar.write(f"Error querying {qid}: {exc}")
             results = []
         elapsed = time.time() - t0
         latencies.append(elapsed)
@@ -125,7 +128,11 @@ def evaluate_retrieval(
                 answer_covered_in_top5 += 1
 
         status_mark = f"Rank #{rank_found}" if rank_found else "Miss"
-        print(f"[{idx:03d}/{total:03d}] {qid} | {status_mark:8s} | {elapsed:.2f}s | {question[:45]}")
+        pbar.write(f"[{idx:03d}/{total:03d}] {qid} | {status_mark:8s} | {elapsed:.2f}s | {question[:45]}")
+        pbar.set_postfix({
+            "mrr": f"{sum(reciprocal_ranks) / idx:.3f}",
+            "r@10": f"{hits_at_10 / idx * 100:.0f}%",
+        })
 
     mrr = sum(reciprocal_ranks) / total if total > 0 else 0.0
     r1 = hits_at_1 / total if total > 0 else 0.0
